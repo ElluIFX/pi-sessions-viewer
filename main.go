@@ -51,7 +51,7 @@ var markedJs string
 //go:embed templates/vendor/highlight.min.js
 var hljsJs string
 
-// ── Live-reload: fetch JSON, diff, append new entries ──────────────────────
+// ── Live-reload: reconnect and refresh the shared reader ──────────────────────
 const liveReloadJs = `
 <script>
 (function() {
@@ -65,11 +65,20 @@ const liveReloadJs = `
   var loading = false;
   var queued = false;
   var es = null;
+  var active = true;
+  var connectionGeneration = 0;
+  var reconnectTimer = null;
+  var refreshTimer = null;
+  var refreshController = null;
   var status = document.createElement('span');
   status.className = 'viewer-live';
   status.setAttribute('role', 'status');
   status.title = 'Local changes update automatically. No transcript is uploaded.';
-  status.textContent = 'Connecting';
+  function setLiveState(state, label) {
+    status.dataset.state = state;
+    status.textContent = label;
+  }
+  setLiveState('connecting', 'Connecting');
   var actions = document.querySelector('.viewer-actions');
   if (actions) actions.prepend(status);
 
@@ -131,14 +140,26 @@ const liveReloadJs = `
   if (FOLLOW) scrollToBottom();
 
   function refresh() {
+    if (!active || navigator.onLine === false) return;
     if (loading) { queued = true; return; }
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
     loading = true;
-    fetch('/api/session?id='+encodeURIComponent(sessId), {cache:'no-store'})
+    var generation = connectionGeneration;
+    var controller = new AbortController();
+    refreshController = controller;
+    var timeout = setTimeout(function() { controller.abort(); }, 10000);
+    fetch('/api/session?id='+encodeURIComponent(sessId), {cache:'no-store', signal:controller.signal})
       .then(function(r) {
-        if (!r.ok) throw new Error(r.status === 404 ? 'Session unavailable' : 'Update failed');
+        if (!r.ok) {
+          var error = new Error(r.status === 404 ? 'Session unavailable' : 'Update failed');
+          error.retryable = r.status >= 500;
+          throw error;
+        }
         return r.json();
       })
       .then(function(data) {
+        if (!active || generation !== connectionGeneration) return;
         if (typeof window.updateSessionData !== 'function') throw new Error('Reload page to update');
         latestData = data;
         var result = window.updateSessionData(data, {follow:FOLLOW, scrollToBottom:FOLLOW}) || {};
@@ -146,24 +167,66 @@ const liveReloadJs = `
           pendingCount += result.added;
           showFollowButton();
         }
-        status.textContent = 'Live';
+        if (es && es.readyState === EventSource.OPEN) setLiveState('live', 'Live');
+        else setLiveState('reconnecting', 'Reconnecting');
       })
-      .catch(function(err) { status.textContent = err.message || 'Update failed'; })
+      .catch(function(err) {
+        if (!active || generation !== connectionGeneration) return;
+        if (navigator.onLine === false) { setLiveState('offline', 'Offline'); return; }
+        setLiveState('error', err.name === 'AbortError' ? 'Update timed out' : (err.retryable === false ? err.message : 'Update failed'));
+        // A failed fetch does not necessarily close the SSE transport. Retry
+        // the read so a transient failure cannot strand a missed update.
+        if (err.retryable !== false) {
+          refreshTimer = setTimeout(function() { refreshTimer = null; refresh(); }, 3000);
+        }
+      })
       .finally(function() {
+        clearTimeout(timeout);
+        if (refreshController === controller) refreshController = null;
         loading = false;
         if (queued) { queued = false; refresh(); }
       });
   }
+  function disconnect() {
+    connectionGeneration++;
+    clearTimeout(reconnectTimer);
+    clearTimeout(refreshTimer);
+    reconnectTimer = refreshTimer = null;
+    queued = false;
+    if (es) { es.close(); es = null; }
+    if (refreshController) refreshController.abort();
+  }
   function connect() {
-    if (es) es.close();
-    es = new EventSource('/events?id='+encodeURIComponent(sessId));
-    es.onopen = function() { status.textContent = 'Live'; refresh(); };
-    es.onmessage = function(e) { if (e.data === 'reload') refresh(); };
-    es.onerror = function() { status.textContent = 'Reconnecting'; };
+    disconnect();
+    if (!active) return;
+    if (navigator.onLine === false) { setLiveState('offline', 'Offline'); return; }
+    setLiveState('connecting', 'Connecting');
+    var source = new EventSource('/events?id='+encodeURIComponent(sessId));
+    es = source;
+    source.onopen = function() {
+      if (es !== source) return;
+      setLiveState('connecting', 'Syncing');
+      refresh();
+    };
+    source.onmessage = function(e) { if (es === source && e.data === 'reload') refresh(); };
+    source.onerror = function() {
+      if (es !== source) return;
+      setLiveState(navigator.onLine === false ? 'offline' : 'reconnecting', navigator.onLine === false ? 'Offline' : 'Reconnecting');
+      // CONNECTING is retried by EventSource itself. CLOSED is terminal and
+      // needs a new object; browsers differ after network failures.
+      if (source.readyState === EventSource.CLOSED && navigator.onLine !== false) {
+        reconnectTimer = setTimeout(connect, 3000);
+      }
+    };
   }
   connect();
-  window.addEventListener('pagehide', function() { if (es) es.close(); });
-  window.addEventListener('pageshow', function(e) { if (e.persisted) connect(); });
+  window.addEventListener('offline', function() {
+    disconnect();
+    setLiveState('offline', 'Offline');
+  });
+  window.addEventListener('online', connect);
+  window.addEventListener('pagehide', function() { active = false; disconnect(); });
+  window.addEventListener('pageshow', function(e) { if (e.persisted) { active = true; connect(); } });
 
   // ── Share button ────────────────────────────────────────────────────────
   var shareBtn = document.getElementById('share-btn');

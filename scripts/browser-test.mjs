@@ -170,6 +170,8 @@ try {
   check(await page.locator('img[src^="https:"]').count() === 0, 'Remote images do not become loading image tags');
   check(await page.locator('a[href^="javascript:"]').count() === 0, 'Unsafe links are suppressed');
   await noOverflow('Desktop reader');
+  await page.locator('#content').evaluate(el => { el.scrollTop = 0; });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
   await screenshot('reader-desktop-dark.png');
   await page.locator('[data-action="toggle-theme"]').click();
   check(await page.locator('html').getAttribute('data-theme') === 'light', 'Reader light theme');
@@ -232,20 +234,55 @@ try {
   check(await page.locator('#entry-live-call .tool-execution.pending').count() === 0, 'Resolved live tool is not pending');
   check(await page.locator('.tree-node[data-id="live-call"]').count() === 1, 'Repeated live refresh does not duplicate entries');
 
-  // Recover a write missed while offline from the first reopened SSE
-  // connection, without requiring another write to trigger a notification.
+  // Recover a write genuinely missed while disconnected, from the first
+  // reopened SSE connection. An independent Node subscriber proves the server
+  // processed the write while the browser was offline, so a delayed watcher
+  // notification cannot accidentally make this regression pass.
   expectedNetworkInterruption = true;
-  await context.setOffline(true);
-  const reconnectEntry = message('reconnected-entry', 'live-result', '2026-10-21T12:02:00Z', 'assistant', [
-    { type: 'text', text: 'RECOVERED_WITHOUT_A_SECOND_WRITE' },
-  ]);
-  await appendFile(livePath, JSON.stringify(reconnectEntry) + '\n');
-  await page.waitForFunction(() => document.querySelector('.viewer-live')?.textContent !== 'Live');
-  check(await page.locator('.tree-node[data-id="reconnected-entry"]').count() === 0, 'Offline reader has not fetched the missed entry');
-  await context.setOffline(false);
-  await page.locator('.tree-node[data-id="reconnected-entry"]').waitFor({ timeout: 20000 });
-  await page.locator('#entry-reconnected-entry').waitFor();
-  check((await page.locator('#entry-reconnected-entry').textContent()).includes('RECOVERED_WITHOUT_A_SECOND_WRITE'), 'SSE reconnect fetches missed data without another write');
+  await page.locator('.viewer-live[data-state="live"]').waitFor();
+  const liveDotColor = await page.locator('.viewer-live').evaluate(el => getComputedStyle(el, '::before').backgroundColor);
+  const watcherAbort = new AbortController();
+  const watcherTimeout = setTimeout(() => watcherAbort.abort(), 15000);
+  let watcherReader;
+  try {
+    const watcherResponse = await fetch(`${base}/events?id=${encodeURIComponent(id)}`, { signal: watcherAbort.signal });
+    check(watcherResponse.ok, 'Independent watcher subscription opens');
+    watcherReader = watcherResponse.body.getReader();
+    const decoder = new TextDecoder();
+    const watcherEvent = async () => {
+      let buffered = '';
+      while (true) {
+        const { value, done } = await watcherReader.read();
+        if (done) throw new Error('Independent watcher closed before observing the missed write');
+        buffered += decoder.decode(value, { stream: true });
+        if (buffered.includes('data: reload\n\n')) return;
+      }
+    };
+    await context.setOffline(true);
+    await page.waitForFunction(() => navigator.onLine === false && document.querySelector('.viewer-live')?.dataset.state === 'offline');
+    check(await page.locator('.viewer-live').textContent() === 'Offline', 'Network loss disconnects the live reader before the write');
+    check(await page.locator('.viewer-live').evaluate(el => getComputedStyle(el, '::before').backgroundColor) !== liveDotColor, 'Offline indicator is not green');
+    const reconnectEntry = message('reconnected-entry', 'live-result', '2026-10-21T12:02:00Z', 'assistant', [
+      { type: 'text', text: 'RECOVERED_WITHOUT_A_SECOND_WRITE' },
+    ]);
+    const observedWrite = watcherEvent();
+    await appendFile(livePath, JSON.stringify(reconnectEntry) + '\n');
+    await observedWrite;
+    check(await page.locator('.tree-node[data-id="reconnected-entry"]').count() === 0, 'Disconnected reader missed a write already processed by the watcher');
+    const reopened = page.waitForResponse(response => new URL(response.url()).pathname === '/events' && response.status() === 200, { timeout: 20000 });
+    await context.setOffline(false);
+    await reopened;
+    check(await page.evaluate(() => navigator.onLine), 'Returning online opens a new SSE connection');
+    await page.locator('.tree-node[data-id="reconnected-entry"]').waitFor({ timeout: 20000 });
+    await page.locator('#entry-reconnected-entry').waitFor();
+    check((await page.locator('#entry-reconnected-entry').textContent()).includes('RECOVERED_WITHOUT_A_SECOND_WRITE'), 'SSE reconnect fetches missed data without another write');
+    await page.locator('.viewer-live[data-state="live"]').waitFor();
+  } finally {
+    clearTimeout(watcherTimeout);
+    watcherAbort.abort();
+    if (watcherReader) await watcherReader.cancel().catch(() => {});
+    await context.setOffline(false);
+  }
   expectedNetworkInterruption = false;
 
   const jsonDownloadPromise = page.waitForEvent('download');

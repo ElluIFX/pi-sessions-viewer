@@ -1249,7 +1249,10 @@
     @media (max-width: 540px) { .viewer-actions { top: 14px; right: 12px; gap: 2px; } .viewer-action { padding: 5px 8px; font-size: 10px; } }
     @media print { .viewer-actions { display: none !important; } }
     .viewer-live { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; color: var(--muted); font: 10px/1.4 var(--font-ui); }
-    .viewer-live::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .8; }
+    .viewer-live::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--muted); opacity: .8; }
+    .viewer-live[data-state="live"]::before { background: var(--success, var(--accent)); }
+    .viewer-live[data-state="connecting"]::before, .viewer-live[data-state="reconnecting"]::before { background: var(--warning); }
+    .viewer-live[data-state="error"]::before { background: var(--error); }
     @media (max-width: 540px) { .viewer-live { padding: 5px; font-size: 9px; } }
     @media (max-width: 540px) {
       .viewer-actions { max-width: calc(100vw - 76px); flex-wrap: wrap; justify-content: flex-end; }
