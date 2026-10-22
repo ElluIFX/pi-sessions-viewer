@@ -419,11 +419,11 @@ func TestSSEWatcherUsesProjectQualifiedIDs(t *testing.T) {
 	writeFixture(t, dir, "b", "same.jsonl", sampleSession)
 	// No background watcher here, to deterministically inspect one scan at a time.
 	s := &server{sessionsDir: dir, fileMod: make(map[string]fileStamp), done: make(chan struct{})}
+	s.scanFiles()
 	a := s.addClient("a/same.jsonl")
 	defer s.removeClient(a)
 	b := s.addClient("b/same.jsonl")
 	defer s.removeClient(b)
-	s.scanFiles()
 	f, err := os.OpenFile(fileA, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -439,6 +439,57 @@ func TestSSEWatcherUsesProjectQualifiedIDs(t *testing.T) {
 	select {
 	case <-b.ch:
 		t.Fatal("same filename in different project received update")
+	default:
+	}
+}
+
+func TestSSEWatcherNotifiesNewFileSubscriberOnFirstScan(t *testing.T) {
+	dir := t.TempDir()
+	// Deliberately omit the background watcher: reproduce the exact ordering
+	// without sleeps or relying on a race with its 1.5-second ticker.
+	s := &server{sessionsDir: dir, fileMod: make(map[string]fileStamp), done: make(chan struct{})}
+	path := writeFixture(t, dir, "new-project", "new-session.jsonl", sampleSession)
+	initial, err := findSession(dir, "new-project/new-session.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := s.addClient(initial.ID)
+	defer s.removeClient(client)
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fmt.Fprintln(file, `{"type":"message","id":"before-first-scan","parentId":"assistant-1","message":{"role":"user","content":"Do not miss this append"}}`)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, known := s.fileMod[initial.ID]; known {
+		t.Fatal("fixture already present in watcher baseline")
+	}
+
+	s.scanFiles()
+	select {
+	case event := <-client.ch:
+		if event != "reload" {
+			t.Fatalf("unexpected event: %q", event)
+		}
+	default:
+		t.Fatal("new session append was missed on the first watcher scan")
+	}
+	updated, err := findSession(dir, initial.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Entries) != len(initial.Entries)+1 || lastLeafID(updated.Entries) != "before-first-scan" {
+		t.Fatal("reloaded session does not include the missed append")
+	}
+	// An unchanged file must not emit an endless stream of refresh events.
+	s.scanFiles()
+	select {
+	case event := <-client.ch:
+		t.Fatalf("unchanged file emitted %q", event)
 	default:
 	}
 }

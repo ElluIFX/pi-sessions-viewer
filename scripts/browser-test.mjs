@@ -320,10 +320,24 @@ try {
   await page.locator('#hamburger').click();
   check(await page.locator('#hamburger').getAttribute('aria-expanded') === 'true', 'Mobile navigation opens');
   check(await page.evaluate(() => document.activeElement.id) === 'tree-search', 'Mobile navigation focuses search');
+  check(await page.locator('.viewer-actions').isHidden(), 'Mobile navigation hides the floating toolbar');
+  check(await page.locator('.viewer-actions').evaluate(el => el.inert), 'Mobile navigation removes toolbar actions from the focus order');
+  check(await page.locator('.sidebar-brand').evaluate(el => {
+    const bounds = el.getBoundingClientRect();
+    return el.contains(document.elementFromPoint(bounds.x + bounds.width - 4, bounds.y + bounds.height / 2));
+  }), 'Mobile navigation heading is not covered by floating controls');
   await screenshot('reader-mobile-navigation.png');
   await page.keyboard.press('Escape');
   check(await page.locator('#hamburger').getAttribute('aria-expanded') === 'false', 'Escape dismisses mobile navigation');
   check(await page.evaluate(() => document.activeElement.id) === 'hamburger', 'Mobile navigation restores focus');
+  check(await page.locator('.viewer-actions').isVisible(), 'Closing mobile navigation restores the toolbar');
+  check(await page.locator('.viewer-actions').evaluate(el => !el.inert), 'Closing mobile navigation restores toolbar keyboard access');
+  await page.locator('#hamburger').click();
+  await page.locator('#sidebar-close').click();
+  check(await page.locator('#hamburger').getAttribute('aria-expanded') === 'false', 'The visible close button dismisses mobile navigation after reopening');
+  check(await page.evaluate(() => document.activeElement.id) === 'hamburger', 'The close button restores focus to navigation opener');
+  check(await page.locator('.viewer-actions').isVisible(), 'The close button restores the toolbar');
+  check(await page.locator('.viewer-actions').evaluate(el => !el.inert), 'The close button restores toolbar keyboard access');
   await page.locator('.viewer-actions a[href="/"]').click();
   await visibleCount('.session-item', 6);
   check(await page.locator('html').getAttribute('data-theme') === 'light', 'Reader theme syncs back to dashboard');
@@ -367,11 +381,16 @@ try {
   check(await page.locator('img[src^="https:"]').count() === 0, 'Adversarial field markup creates no remote images');
   await page.locator('[data-filter="all"]').click();
   check(await page.locator('.tree-node[data-id="attack-result"]').count() === 1, 'Adversarial toolName remains safely navigable');
+  check((await page.locator('.tree-node[data-id="attack-compaction"]').textContent()).includes('0k tokens'), 'Malformed compaction token counts have a numeric tree fallback');
+  check(!(await page.locator('#tree-container').textContent()).includes('NaN'), 'Malformed metadata never renders NaN in the tree');
   await page.locator('.tree-node[data-id="attack-result"]').click();
   check(await page.evaluate(() => window.hacked === undefined), 'Tree navigation never executes adversarial field markup');
   await page.locator('#tree-search').fill('not a matching entry');
   await page.locator('.tree-empty').waitFor();
   await page.locator('#tree-search').press('Escape');
+  check(await page.locator('#tree-search').inputValue() === '', 'Escape clears the adversarial search input');
+  await page.locator('.tree-node[data-id="attack-final"]').waitFor();
+  check(await page.locator('.tree-empty').count() === 0, 'Escape restores search results before live updates');
   await noOverflow('Adversarial reader');
   await screenshot('reader-adversarial-input.png');
   // A live result exercises the same normalization path on an already-open document.

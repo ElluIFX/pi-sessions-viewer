@@ -711,7 +711,7 @@
             return labelHtml + `<span class="tree-muted">[${escapeHtml(msg.role)}]</span>`;
           }
           case 'compaction':
-            return labelHtml + `<span class="tree-compaction">[compaction: ${Math.round(entry.tokensBefore/1000)}k tokens]</span>`;
+            return labelHtml + `<span class="tree-compaction">[compaction: ${Math.round(finiteNumber(entry.tokensBefore)/1000)}k tokens]</span>`;
           case 'branch_summary': {
             const summary = truncate(normalize(entry.summary || ''));
             return labelHtml + `<span class="tree-branch-summary">[branch summary]:</span> ${escapeHtml(summary)}`;
@@ -1812,11 +1812,20 @@
 
       setupSidebarResize();
 
+      function syncSidebarChrome() {
+        const open = isMobileLayout() && sidebar.classList.contains('open');
+        document.body.classList.toggle('sidebar-open', open);
+        // Server actions live outside #content. Keep them out of the mobile
+        // drawer's focus order as well as behind its visual overlay.
+        document.querySelectorAll('.viewer-actions, .viewer-follow').forEach(el => { el.inert = open; });
+      }
+
       const openSidebar = () => {
         sidebar.classList.add('open');
         overlay.classList.add('open');
         hamburger.style.display = 'none';
         hamburger.setAttribute('aria-expanded', 'true');
+        syncSidebarChrome();
         if (isMobileLayout()) document.getElementById('content').inert = true;
         searchInput.focus();
       };
@@ -1827,6 +1836,7 @@
         overlay.classList.remove('open');
         hamburger.style.display = '';
         hamburger.setAttribute('aria-expanded', 'false');
+        syncSidebarChrome();
         document.getElementById('content').inert = false;
         if (restoreFocus && isMobileLayout()) hamburger.focus();
       };

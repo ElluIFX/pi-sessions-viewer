@@ -1215,6 +1215,7 @@
     @media (max-width: 900px) {
       #sidebar { width: min(360px, calc(100vw - 32px)); min-width: min(360px, calc(100vw - 32px)); max-width: min(360px, calc(100vw - 32px)); height: 100vh; height: 100dvh; }
       #sidebar:not(.open) { visibility: hidden; }
+      body.sidebar-open .viewer-actions, body.sidebar-open .viewer-follow { visibility: hidden; pointer-events: none; }
       #content { padding: 72px 16px 40px; }
       .header { padding: 22px; }
       .sidebar-header { padding-top: 20px; }

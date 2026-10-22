@@ -533,7 +533,9 @@ func (s *server) scanFiles() {
 			}
 			stamp := fileStamp{info.ModTime(), info.Size()}
 			next[id] = stamp
-			if before, known := s.fileMod[id]; known && before != stamp {
+			// A session can be opened and appended before its first poll.
+			// Notify current subscribers on discovery too, not only on later changes.
+			if before, known := s.fileMod[id]; !known || before != stamp {
 				s.broadcast(id, "reload")
 			}
 		}
