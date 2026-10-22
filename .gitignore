@@ -1,3 +1,7 @@
 pi-sessions-viewer
 *.exe
 .DS_Store
+
+dist/
+node_modules/
+browser-artifacts/

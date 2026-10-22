@@ -1,25 +1,40 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "embed"
 )
 
 const defaultPort = "27183"
+
+// Set by release builds with -ldflags. Development builds remain identifiable.
+var version = "dev"
+var commit = "unknown"
+var buildDate = "unknown"
+
+const contentSecurityPolicy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 //go:embed templates/template.html
 var templateHtml string
@@ -40,421 +55,115 @@ var hljsJs string
 const liveReloadJs = `
 <script>
 (function() {
-  var SEEN = new Set();
-  document.querySelectorAll('[id^="entry-"]').forEach(function(el) {
-    SEEN.add(el.id.replace('entry-', ''));
-  });
+  var params = new URLSearchParams(location.search);
+  var sessId = params.get('id') || '';
+  var branchPaused = params.has('leafId') || params.has('targetId');
+  var FOLLOW = !branchPaused;
+  var followBtn = null;
+  var pendingCount = 0;
+  var latestData = null;
+  var loading = false;
+  var queued = false;
+  var es = null;
+  var status = document.createElement('span');
+  status.className = 'viewer-live';
+  status.setAttribute('role', 'status');
+  status.title = 'Local changes update automatically. No transcript is uploaded.';
+  status.textContent = 'Connecting';
+  var actions = document.querySelector('.viewer-actions');
+  if (actions) actions.prepend(status);
 
   function escapeHtml(t) {
     var d = document.createElement('div');
-    d.textContent = t;
-    return d.innerHTML;
+    d.textContent = String(t == null ? '' : t);
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
-  function extractContent(c) {
-    if (typeof c === 'string') return c;
-    if (Array.isArray(c)) return c.filter(function(x){return x.type==='text'}).map(function(x){return x.text}).join('');
-    return '';
-  }
-  function fmtTs(ts) {
-    if (!ts) return '';
-    var d = new Date(ts);
-    return d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  }
-  function shortenPath(p) {
-    if (typeof p !== 'string') return '';
-    if (p.indexOf('/Users/')===0) { var parts=p.split('/'); if(parts.length>2) return '~'+p.slice(('/Users/'+parts[2]).length); }
-    if (p.indexOf('/home/')===0) { var parts=p.split('/'); if(parts.length>2) return '~'+p.slice(('/home/'+parts[2]).length); }
-    return p;
-  }
-  function formatToolCall(name, args) {
-    args = args || {};
-    switch(name) {
-      case 'read':
-        var path = shortenPath(String(args.path || args.file_path || ''));
-        var off = args.offset, lim = args.limit;
-        if (off !== undefined || lim !== undefined) { var s = off||1, e = lim ? s+lim-1 : ''; path += ':'+s+(e?'-'+e:''); }
-        return '[read: '+path+']';
-      case 'write': return '[write: '+shortenPath(String(args.path || args.file_path || ''))+']';
-      case 'edit': return '[edit: '+shortenPath(String(args.path || args.file_path || ''))+']';
-      case 'bash':
-        var raw = String(args.command || '');
-        var cmd = raw.replace(/[\n\t]/g,' ').trim().slice(0,50);
-        return '[bash: '+cmd+(raw.length>50?'...':'')+']';
-      case 'grep': return '[grep: /'+(args.pattern||'')+'/ in '+shortenPath(String(args.path||'.'))+']';
-      case 'find': return '[find: '+(args.pattern||'')+' in '+shortenPath(String(args.path||'.'))+']';
-      case 'ls': return '[ls: '+shortenPath(String(args.path||'.'))+']';
-      default:
-        var s = JSON.stringify(args).slice(0,40);
-        return '['+name+': '+s+(JSON.stringify(args).length>40?'...':'')+']';
-    }
-  }
-  function safeMarked(text) {
-    try { return marked.parse(text); } catch(e) { return escapeHtml(text); }
-  }
-
-  var TOOL_RESULT_CACHE = {};
-  function cacheToolResults(entries) {
-    entries.forEach(function(e) {
-      if (e.type === 'message' && e.message && e.message.role === 'toolResult' && e.message.toolCallId) {
-        TOOL_RESULT_CACHE[e.message.toolCallId] = e.message;
-      }
-    });
-  }
-
-  function renderToolCall(call, result) {
-    var isError = result && result.isError;
-    var status = result ? (isError ? 'error' : 'success') : 'pending';
-    var html = '<div class="tool-execution '+status+'">';
-    var args = call.arguments || {};
-    var invalid = '<span class="tool-error">[invalid arg]</span>';
-
-    function getResultText() {
-      if (!result) return '';
-      return (result.content||[]).filter(function(c){return c.type==='text'}).map(function(c){return c.text}).join('\n');
-    }
-    function getResultImages() {
-      if (!result) return [];
-      return (result.content||[]).filter(function(c){return c.type==='image'});
-    }
-
-    if (call.name === 'bash') {
-      var cmd = typeof args.command === 'string' ? escapeHtml(args.command) : invalid;
-      html += '<div class="tool-command">$ '+cmd+'</div>';
-      if (result) {
-        var out = getResultText().trim();
-        if (out) html += '<div class="tool-output"><pre>'+escapeHtml(out)+'</pre></div>';
-      }
-    } else if (call.name === 'read') {
-      var fp = typeof (args.file_path || args.path) === 'string' ? shortenPath(String(args.file_path || args.path || '')) : invalid;
-      html += '<div class="tool-header"><span class="tool-name">read</span> <span class="tool-path">'+escapeHtml(fp)+'</span></div>';
-      if (result) {
-        var imgs = getResultImages();
-        imgs.forEach(function(img) {
-          html += '<img src="data:'+escapeHtml(img.mimeType||'image/png')+';base64,'+img.data+'" class="tool-image" />';
-        });
-        var out = getResultText();
-        if (out) html += '<div class="tool-output"><pre>'+escapeHtml(out)+'</pre></div>';
-      }
-    } else if (call.name === 'write') {
-      var fp = typeof (args.file_path || args.path) === 'string' ? escapeHtml(shortenPath(String(args.file_path || args.path || ''))) : invalid;
-      html += '<div class="tool-header"><span class="tool-name">write</span> <span class="tool-path">'+fp+'</span></div>';
-      if (typeof args.content === 'string') {
-        html += '<div class="tool-output"><pre>'+escapeHtml(args.content)+'</pre></div>';
-      } else if (args.content !== undefined) {
-        html += '<div class="tool-error">[invalid content arg - expected string]</div>';
-      }
-      if (result) {
-        var out = getResultText().trim();
-        if (out) html += '<div class="tool-output"><div>'+escapeHtml(out)+'</div></div>';
-      }
-    } else if (call.name === 'edit') {
-      var fp = typeof (args.file_path || args.path) === 'string' ? escapeHtml(shortenPath(String(args.file_path || args.path || ''))) : invalid;
-      html += '<div class="tool-header"><span class="tool-name">edit</span> <span class="tool-path">'+fp+'</span></div>';
-      if (result && result.details && result.details.diff) {
-        var lines = result.details.diff.split('\n');
-        html += '<div class="tool-diff">';
-        lines.forEach(function(line) {
-          var cls = line.match(/^\+/) ? 'diff-added' : line.match(/^-/) ? 'diff-removed' : 'diff-context';
-          html += '<div class="'+cls+'">'+escapeHtml(line)+'</div>';
-        });
-        html += '</div>';
-      } else if (result) {
-        var out = getResultText().trim();
-        if (out) html += '<div class="tool-output"><pre>'+escapeHtml(out)+'</pre></div>';
-      }
-    } else if (call.name === 'ls') {
-      var dp = typeof args.path === 'string' ? escapeHtml(shortenPath(String(args.path || '.'))) : invalid;
-      html += '<div class="tool-header"><span class="tool-name">ls</span> <span class="tool-path">'+dp+'</span></div>';
-      if (result) {
-        var out = getResultText().trim();
-        if (out) html += '<div class="tool-output"><pre>'+escapeHtml(out)+'</pre></div>';
-      }
-    } else {
-      html += '<div class="tool-header"><span class="tool-name">'+escapeHtml(call.name)+'</span></div>';
-      html += '<div class="tool-output"><pre>'+escapeHtml(JSON.stringify(args,null,2))+'</pre></div>';
-      if (result) {
-        var out = getResultText();
-        if (out) html += '<div class="tool-output"><pre>'+escapeHtml(out)+'</pre></div>';
-      }
-    }
-    html += '</div>';
-    return html;
-  }
-
-  function renderEntry(entry, allEntries) {
-    cacheToolResults(allEntries);
-    var ts = fmtTs(entry.timestamp);
-    var tsHtml = ts ? '<div class="message-timestamp">'+ts+'</div>' : '';
-    var eid = 'entry-' + entry.id;
-
-    if (entry.type === 'message') {
-      var msg = entry.message;
-      if (msg.role === 'user') {
-        var html = '<div class="user-message" id="'+eid+'">'+tsHtml;
-        var content = msg.content;
-        if (Array.isArray(content)) {
-          var imgs = content.filter(function(c){return c.type==='image'});
-          if (imgs.length) {
-            html += '<div class="message-images">';
-            imgs.forEach(function(img) {
-              html += '<img src="data:'+escapeHtml(img.mimeType||'image/png')+';base64,'+img.data+'" class="message-image" />';
-            });
-            html += '</div>';
-          }
-        }
-        var text = typeof content === 'string' ? content : extractContent(content);
-        if (text.trim()) html += '<div class="markdown-content">'+safeMarked(text)+'</div>';
-        html += '</div>';
-        return html;
-      }
-      if (msg.role === 'assistant') {
-        var html = '<div class="assistant-message" id="'+eid+'">'+tsHtml;
-        var content = msg.content || [];
-        content.forEach(function(block) {
-          if (block.type === 'text' && block.text.trim()) {
-            html += '<div class="assistant-text markdown-content">'+safeMarked(block.text)+'</div>';
-          } else if (block.type === 'thinking' && block.thinking.trim()) {
-            html += '<div class="thinking-block"><div class="thinking-text">'+escapeHtml(block.thinking)+'</div></div>';
-          }
-        });
-        content.forEach(function(block) {
-          if (block.type === 'toolCall') {
-            var result = TOOL_RESULT_CACHE[block.id];
-            html += renderToolCall(block, result);
-          }
-        });
-        if (msg.stopReason === 'aborted') html += '<div class="error-text">Aborted</div>';
-        else if (msg.stopReason === 'error') html += '<div class="error-text">Error: '+escapeHtml(msg.errorMessage||'Unknown error')+'</div>';
-        html += '</div>';
-        return html;
-      }
-      if (msg.role === 'bashExecution') {
-        var isErr = msg.cancelled || (msg.exitCode !== 0 && msg.exitCode !== null);
-        var html = '<div class="tool-execution '+(isErr?'error':'success')+'" id="'+eid+'">'+tsHtml;
-        html += '<div class="tool-command">$ '+escapeHtml(msg.command)+'</div>';
-        if (msg.output) html += '<div class="tool-output"><pre>'+escapeHtml(msg.output)+'</pre></div>';
-        if (msg.cancelled) html += '<div style="color:var(--warning)">(cancelled)</div>';
-        else if (msg.exitCode !== 0 && msg.exitCode !== null) html += '<div style="color:var(--error)">(exit '+msg.exitCode+')</div>';
-        html += '</div>';
-        return html;
-      }
-      if (msg.role === 'toolResult') return '';
-    }
-    if (entry.type === 'model_change') {
-      return '<div class="model-change" id="'+eid+'">'+tsHtml+'Switched to model: <span class="model-name">'+escapeHtml(entry.provider)+'/'+escapeHtml(entry.modelId)+'</span></div>';
-    }
-    if (entry.type === 'compaction') {
-      return '<div class="compaction" id="'+eid+'"><div class="compaction-label">[compaction]</div><div class="compaction-collapsed">Compacted from '+entry.tokensBefore.toLocaleString()+' tokens</div></div>';
-    }
-    if (entry.type === 'branch_summary') {
-      return '<div class="branch-summary" id="'+eid+'">'+tsHtml+'<div class="branch-summary-header">Branch Summary</div><div class="markdown-content">'+safeMarked(entry.summary||'')+'</div></div>';
-    }
-    if (entry.type === 'custom_message' && entry.display) {
-      return '<div class="hook-message" id="'+eid+'">'+tsHtml+'<div class="hook-type">['+escapeHtml(entry.customType)+']</div><div class="markdown-content">'+safeMarked(typeof entry.content === 'string' ? entry.content : JSON.stringify(entry.content))+'</div></div>';
-    }
-    return '';
-  }
-
-  // ── Follow mode (like terminal/chat) ───────────────────────────────────
-  var FOLLOW = true;
-  var followBtn = null;
-  var pendingCount = 0;
-
   function isAtBottom() {
-    // Check document-level scroll (what users actually scroll)
-    var de = document.documentElement;
-    var body = document.body;
-    var docHeight = Math.max(de.scrollHeight, body.scrollHeight);
-    var scrolled = window.scrollY || window.pageYOffset || de.scrollTop || body.scrollTop;
-    var viewport = window.innerHeight;
-    var remaining = docHeight - scrolled - viewport;
-
-    // Also check #content if it has its own scrollbar
     var content = document.getElementById('content');
     if (content && content.scrollHeight > content.clientHeight) {
-      var contentRemaining = content.scrollHeight - content.scrollTop - content.clientHeight;
-      remaining = Math.max(remaining, contentRemaining);
+      return content.scrollHeight - content.scrollTop - content.clientHeight < 80;
     }
-
-    return remaining < 80;
+    return document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 80;
   }
-
-  function scrollToBottom(smooth) {
+  function scrollToBottom() {
     var content = document.getElementById('content');
-    if (content && content.scrollHeight > content.clientHeight) {
-      content.scrollTo({ top: content.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
-    }
-    window.scrollTo({ top: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight), behavior: smooth ? 'smooth' : 'auto' });
+    if (content) content.scrollTop = content.scrollHeight;
+    window.scrollTo(0, document.documentElement.scrollHeight);
   }
-
-  function showFollowButton() {
-    if (followBtn) {
-      followBtn.textContent = '↓ ' + pendingCount + ' new' + (pendingCount > 1 ? 's' : '');
-      return;
-    }
-    followBtn = document.createElement('button');
-    followBtn.textContent = '↓ ' + pendingCount + ' new' + (pendingCount > 1 ? 's' : '');
-    followBtn.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:200;padding:6px 14px;font-size:11px;font-family:inherit;background:var(--accent);color:var(--body-bg);border:none;border-radius:4px;cursor:pointer;opacity:0;transition:opacity 0.2s;box-shadow:0 2px 8px rgba(0,0,0,0.3);';
-    document.body.appendChild(followBtn);
-    requestAnimationFrame(function() { followBtn.style.opacity = '1'; });
-    followBtn.addEventListener('click', function() {
-      FOLLOW = true;
-      pendingCount = 0;
-      scrollToBottom(true);
-      hideFollowButton();
-    });
-  }
-
   function hideFollowButton() {
-    if (!followBtn) return;
-    followBtn.style.opacity = '0';
-    setTimeout(function() {
-      if (followBtn && followBtn.parentNode) {
-        followBtn.parentNode.removeChild(followBtn);
-      }
-      followBtn = null;
-    }, 200);
+    if (followBtn) followBtn.remove();
+    followBtn = null;
   }
-
-  function onScroll() {
-    var wasFollowing = FOLLOW;
-    FOLLOW = isAtBottom();
-    if (FOLLOW && followBtn) {
-      hideFollowButton();
-      pendingCount = 0;
+  function showFollowButton() {
+    if (!followBtn) {
+      followBtn = document.createElement('button');
+      followBtn.className = 'viewer-follow';
+      followBtn.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:200;padding:9px 15px;font:inherit;background:var(--accent);color:var(--body-bg);border:none;border-radius:8px;cursor:pointer;box-shadow:0 3px 16px rgba(0,0,0,.15);';
+      document.body.appendChild(followBtn);
+      followBtn.addEventListener('click', function() {
+        branchPaused = false;
+        FOLLOW = true;
+        pendingCount = 0;
+        if (latestData && typeof window.updateSessionData === 'function') {
+          window.updateSessionData(latestData, {follow:true, forceLatest:true, scrollToBottom:true});
+        } else { scrollToBottom(); }
+        hideFollowButton();
+      });
     }
+    followBtn.textContent = pendingCount ? '↓ '+pendingCount+' new · Follow latest' : '↓ Follow latest';
   }
-
-  // Listen on both window and content element
-  window.addEventListener('scroll', onScroll, { passive: true });
-  var contentEl = document.getElementById('content');
-  if (contentEl) contentEl.addEventListener('scroll', onScroll, { passive: true });
-  // Start at bottom on first load
-  scrollToBottom(false);
-
-  function appendEntry(entry, allEntries) {
-    if (SEEN.has(entry.id)) return;
-    var html = renderEntry(entry, allEntries);
-    if (!html) { SEEN.add(entry.id); return; }
-    var container = document.getElementById('messages');
-    if (!container) return;
-    var wrap = document.createElement('div');
-    wrap.innerHTML = html;
-    var node = wrap.firstElementChild;
-    if (!node) return;
-    container.appendChild(node);
-    SEEN.add(entry.id);
-    node.style.transition = 'box-shadow 0.8s ease-out';
-    node.style.boxShadow = '0 0 0 2px var(--accent)';
-    setTimeout(function() { node.style.boxShadow = ''; }, 1500);
-
-    if (FOLLOW) {
-      scrollToBottom(true);
-    } else {
-      pendingCount++;
+  function onScroll() {
+    if (branchPaused) return;
+    FOLLOW = isAtBottom();
+    if (FOLLOW) { pendingCount = 0; hideFollowButton(); }
+  }
+  window.addEventListener('scroll', onScroll, {passive:true});
+  var content = document.getElementById('content');
+  if (content) content.addEventListener('scroll', onScroll, {passive:true});
+  var tree = document.getElementById('tree-container');
+  if (tree) tree.addEventListener('click', function(e) {
+    if (e.target.closest('.tree-node')) {
+      branchPaused = true;
+      FOLLOW = false;
       showFollowButton();
     }
-  }
+  });
+  if (FOLLOW) scrollToBottom();
 
-  function updateStats(entries) {
-    var user=0, assistant=0, toolCalls=0;
-    var tokens={input:0,output:0,cacheRead:0,cacheWrite:0};
-    var cost={input:0,output:0,cacheRead:0,cacheWrite:0};
-    var models=new Set();
-    entries.forEach(function(e) {
-      if (e.type !== 'message' || !e.message) return;
-      var m = e.message;
-      if (m.role === 'user') user++;
-      if (m.role === 'assistant') {
-        assistant++;
-        if (m.model) models.add(m.provider ? m.provider+'/'+m.model : m.model);
-        if (m.usage) {
-          tokens.input += m.usage.input||0;
-          tokens.output += m.usage.output||0;
-          tokens.cacheRead += m.usage.cacheRead||0;
-          tokens.cacheWrite += m.usage.cacheWrite||0;
-          if (m.usage.cost) {
-            cost.input += m.usage.cost.input||0;
-            cost.output += m.usage.cost.output||0;
-            cost.cacheRead += m.usage.cost.cacheRead||0;
-            cost.cacheWrite += m.usage.cost.cacheWrite||0;
-          }
-        }
-        toolCalls += (m.content||[]).filter(function(c){return c.type==='toolCall'}).length;
-      }
-    });
-    var totalCost = cost.input+cost.output+cost.cacheRead+cost.cacheWrite;
-    var headerInfo = document.querySelector('.header-info');
-    if (!headerInfo) return;
-    var parts = [];
-    if (user) parts.push(user+' user');
-    if (assistant) parts.push(assistant+' assistant');
-    var rows = headerInfo.querySelectorAll('.info-item');
-    rows.forEach(function(row) {
-      var label = row.querySelector('.info-label');
-      if (!label) return;
-      var text = label.textContent;
-      var val = row.querySelector('.info-value');
-      if (!val) return;
-      if (text.indexOf('Messages:') >= 0) val.textContent = parts.join(', ') || '0';
-      if (text.indexOf('Tool Calls:') >= 0) val.textContent = toolCalls;
-      if (text.indexOf('Models:') >= 0) val.textContent = Array.from(models).join(', ') || 'unknown';
-      if (text.indexOf('Tokens:') >= 0) {
-        var tps = [];
-        if (tokens.input) tps.push('\u2191'+formatTokens(tokens.input));
-        if (tokens.output) tps.push('\u2193'+formatTokens(tokens.output));
-        if (tokens.cacheRead) tps.push('R'+formatTokens(tokens.cacheRead));
-        if (tokens.cacheWrite) tps.push('W'+formatTokens(tokens.cacheWrite));
-        val.textContent = tps.join(' ') || '0';
-      }
-      if (text.indexOf('Cost:') >= 0) val.textContent = '$'+totalCost.toFixed(3);
-    });
-  }
-  function formatTokens(n) {
-    if (n < 1000) return n.toString();
-    if (n < 10000) return (n/1000).toFixed(1)+'k';
-    if (n < 1000000) return Math.round(n/1000)+'k';
-    return (n/1000000).toFixed(1)+'M';
-  }
-
-  var sessId = location.search.split('id=')[1]?.split('&')[0] || '';
-  var es = new EventSource('/events?id=' + encodeURIComponent(sessId));
-  var indicator = null;
-
-  function showIndicator() {
-    if (indicator) return;
-    indicator = document.createElement('div');
-    indicator.textContent = 'updated';
-    indicator.style.cssText = 'position:fixed;top:8px;right:8px;z-index:200;padding:2px 8px;font-size:10px;font-family:inherit;background:var(--accent);color:var(--body-bg);border-radius:3px;opacity:0;transition:opacity 0.3s;';
-    document.body.appendChild(indicator);
-    requestAnimationFrame(function() { indicator.style.opacity = '1'; });
-    setTimeout(function() {
-      indicator.style.opacity = '0';
-      setTimeout(function() { if(indicator){document.body.removeChild(indicator);indicator=null;} }, 300);
-    }, 1200);
-  }
-
-  es.onmessage = function(e) {
-    if (e.data !== 'reload') return;
-    fetch('/api/session?id=' + encodeURIComponent(sessId))
-      .then(function(r){return r.json();})
-      .then(function(data) {
-        var entries = data.entries || [];
-        var newCount = 0;
-        entries.forEach(function(entry) {
-          if (entry.id && !SEEN.has(entry.id)) {
-            appendEntry(entry, entries);
-            newCount++;
-          }
-        });
-        if (newCount > 0) {
-          showIndicator();
-          updateStats(entries);
-        }
+  function refresh() {
+    if (loading) { queued = true; return; }
+    loading = true;
+    fetch('/api/session?id='+encodeURIComponent(sessId), {cache:'no-store'})
+      .then(function(r) {
+        if (!r.ok) throw new Error(r.status === 404 ? 'Session unavailable' : 'Update failed');
+        return r.json();
       })
-      .catch(function(err){ console.error('Live update failed:', err); });
-  };
-  es.onerror = function() {};
+      .then(function(data) {
+        if (typeof window.updateSessionData !== 'function') throw new Error('Reload page to update');
+        latestData = data;
+        var result = window.updateSessionData(data, {follow:FOLLOW, scrollToBottom:FOLLOW}) || {};
+        if (!FOLLOW && result.added > 0) {
+          pendingCount += result.added;
+          showFollowButton();
+        }
+        status.textContent = 'Live';
+      })
+      .catch(function(err) { status.textContent = err.message || 'Update failed'; })
+      .finally(function() {
+        loading = false;
+        if (queued) { queued = false; refresh(); }
+      });
+  }
+  function connect() {
+    if (es) es.close();
+    es = new EventSource('/events?id='+encodeURIComponent(sessId));
+    es.onopen = function() { status.textContent = 'Live'; refresh(); };
+    es.onmessage = function(e) { if (e.data === 'reload') refresh(); };
+    es.onerror = function() { status.textContent = 'Reconnecting'; };
+  }
+  connect();
+  window.addEventListener('pagehide', function() { if (es) es.close(); });
+  window.addEventListener('pageshow', function(e) { if (e.persisted) connect(); });
 
   // ── Share button ────────────────────────────────────────────────────────
   var shareBtn = document.getElementById('share-btn');
@@ -487,12 +196,12 @@ const liveReloadJs = `
     document.getElementById('share-copy-gist').addEventListener('click', function() {
       navigator.clipboard.writeText(gistUrl).catch(function(){});
       this.textContent = 'Copied!';
-      setTimeout(function(){ document.getElementById('share-copy-gist').textContent = 'Copy Gist'; }, 1200);
+      setTimeout(function(){ var button=document.getElementById('share-copy-gist'); if(button) button.textContent='Copy Gist'; }, 1200);
     });
     document.getElementById('share-copy-preview').addEventListener('click', function() {
       navigator.clipboard.writeText(previewUrl).catch(function(){});
       this.textContent = 'Copied!';
-      setTimeout(function(){ document.getElementById('share-copy-preview').textContent = 'Copy Preview'; }, 1200);
+      setTimeout(function(){ var button=document.getElementById('share-copy-preview'); if(button) button.textContent='Copy Preview'; }, 1200);
     });
   }
 
@@ -517,9 +226,10 @@ const liveReloadJs = `
 
   if (shareBtn) {
     shareBtn.addEventListener('click', function() {
+      if (!window.confirm('Upload this entire session to GitHub as a secret Gist?\n\nIt includes messages, code, tool output, paths and attached images, which may contain credentials or personal information. Secret Gists are unlisted, NOT private: anyone with the link can read them. Review the local export first.\n\nChoose OK only if you want to upload now.')) return;
       shareBtn.textContent = '...';
       shareBtn.disabled = true;
-      fetch('/share?id=' + encodeURIComponent(sessId))
+      fetch('/share?id=' + encodeURIComponent(sessId), {method:'POST', headers:{'Content-Type':'application/json', 'X-Pi-Share':'1'}, body:JSON.stringify({confirmed:true})})
         .then(function(r){ return r.json(); })
         .then(function(data) {
           shareBtn.textContent = '↗ Share';
@@ -543,37 +253,71 @@ const liveReloadJs = `
 
 func main() {
 	port := flag.String("p", defaultPort, "port to listen on")
+	host := flag.String("host", "127.0.0.1", "address to bind (non-loopback exposes private sessions without authentication)")
 	open := flag.Bool("o", false, "auto-open browser")
+	home, _ := os.UserHomeDir()
+	sessionsDir := flag.String("sessions-dir", filepath.Join(home, ".pi", "agent", "sessions"), "directory containing project session folders")
+	sharing := flag.Bool("enable-sharing", false, "enable explicitly confirmed GitHub secret Gist uploads (requires gh)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
-
-	sessionsDir := filepath.Join(os.Getenv("HOME"), ".pi", "agent", "sessions")
-	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "sessions directory not found: %s\n", sessionsDir)
+	if *showVersion {
+		fmt.Printf("pi-sessions-viewer %s (commit %s, built %s)\n", version, commit, buildDate)
+		return
+	}
+	if flag.NArg() != 0 || *host == "" {
+		fmt.Fprintln(os.Stderr, "unexpected arguments or empty -host; use -help for usage")
+		os.Exit(2)
+	}
+	info, err := os.Stat(*sessionsDir)
+	if err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "sessions directory unavailable: %s\nUse -sessions-dir to select an existing directory.\n", *sessionsDir)
 		os.Exit(1)
 	}
-
-	srv := newServer(sessionsDir)
-	http.HandleFunc("/", srv.handleIndex)
-	http.HandleFunc("/session", srv.handleSession)
-	http.HandleFunc("/api/session", srv.handleApiSession)
-	http.HandleFunc("/share", srv.handleShare)
-	http.HandleFunc("/events", srv.handleEvents)
-
-	addr := ":" + *port
-	fmt.Printf("🥧 Pi Sessions Viewer → http://localhost%s\n", addr)
-	fmt.Printf("   Serving from: %s\n", sessionsDir)
-
-	if *open {
-		go func() {
-			time.Sleep(300 * time.Millisecond)
-			openBrowser("http://localhost" + addr)
-		}()
+	srv := newServer(*sessionsDir)
+	defer srv.Close()
+	srv.bindHost = *host
+	srv.sharingEnabled = *sharing
+	addr := net.JoinHostPort(*host, *port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot listen on %s: %v\n", addr, err)
+		os.Exit(1)
 	}
-
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	browserHost := *host
+	if browserHost == "0.0.0.0" || browserHost == "::" {
+		browserHost = "127.0.0.1"
+	}
+	_, actualPort, _ := net.SplitHostPort(listener.Addr().String())
+	browserURL := "http://" + net.JoinHostPort(browserHost, actualPort)
+	fmt.Printf("Pi Sessions Viewer %s → %s\n   Serving from: %s\n", version, browserURL, *sessionsDir)
+	if !isLoopbackHost(*host) {
+		fmt.Fprintln(os.Stderr, "WARNING: non-loopback binding exposes session contents without authentication. Use only a trusted network or protected tunnel.")
+	}
+	if *sharing {
+		fmt.Println("   GitHub sharing enabled: each upload requires explicit confirmation.")
+	}
+	if *open {
+		go openBrowser(browserURL)
+	}
+	httpServer := &http.Server{Handler: srv.handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		srv.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			httpServer.Close()
+		}
+	}()
+	if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
+	<-shutdownDone
 }
 
 func openBrowser(url string) {
@@ -590,7 +334,9 @@ func openBrowser(url string) {
 		cmd = "xdg-open"
 		args = []string{url}
 	}
-	exec.Command(cmd, args...).Start()
+	if err := exec.Command(cmd, args...).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "could not open browser; open %s manually\n", url)
+	}
 }
 
 // ── Server with live-reload SSE ────────────────────────────────────────────
@@ -600,44 +346,65 @@ type sseClient struct {
 	sessID string
 }
 
+type fileStamp struct {
+	modified time.Time
+	size     int64
+}
+
 type server struct {
-	sessionsDir string
-	clients     []*sseClient
-	clientsMu   sync.RWMutex
-	fileMod     map[string]time.Time
-	fileModMu   sync.RWMutex
+	sessionsDir    string
+	bindHost       string
+	sharingEnabled bool
+	clients        []*sseClient
+	clientsMu      sync.RWMutex
+	fileMod        map[string]fileStamp
+	done           chan struct{}
+	watchDone      chan struct{}
+	closeOnce      sync.Once
 }
 
 func newServer(sessionsDir string) *server {
-	s := &server{
-		sessionsDir: sessionsDir,
-		clients:     make([]*sseClient, 0),
-		fileMod:     make(map[string]time.Time),
-	}
+	s := &server{sessionsDir: sessionsDir, bindHost: "127.0.0.1", fileMod: make(map[string]fileStamp), done: make(chan struct{}), watchDone: make(chan struct{})}
 	go s.watchFiles()
 	return s
 }
 
-func (s *server) addClient(sessID string) chan string {
-	ch := make(chan string, 4)
-	c := &sseClient{ch: ch, sessID: sessID}
+func (s *server) Close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		<-s.watchDone
+		s.clientsMu.Lock()
+		defer s.clientsMu.Unlock()
+		for _, c := range s.clients {
+			close(c.ch)
+		}
+		s.clients = nil
+	})
+}
+
+func (s *server) addClient(sessID string) *sseClient {
+	c := &sseClient{ch: make(chan string, 4), sessID: sessID}
 	s.clientsMu.Lock()
-	s.clients = append(s.clients, c)
-	s.clientsMu.Unlock()
-	return ch
+	defer s.clientsMu.Unlock()
+	select {
+	case <-s.done:
+		close(c.ch)
+	default:
+		s.clients = append(s.clients, c)
+	}
+	return c
 }
 
 func (s *server) removeClient(target *sseClient) {
 	s.clientsMu.Lock()
-	filtered := s.clients[:0]
-	for _, c := range s.clients {
-		if c != target {
-			filtered = append(filtered, c)
+	defer s.clientsMu.Unlock()
+	for i, c := range s.clients {
+		if c == target {
+			s.clients = append(s.clients[:i], s.clients[i+1:]...)
+			close(c.ch)
+			return
 		}
 	}
-	s.clients = filtered
-	s.clientsMu.Unlock()
-	close(target.ch)
 }
 
 func (s *server) broadcast(sessID, msg string) {
@@ -654,109 +421,204 @@ func (s *server) broadcast(sessID, msg string) {
 }
 
 func (s *server) watchFiles() {
+	defer close(s.watchDone)
 	ticker := time.NewTicker(1500 * time.Millisecond)
 	defer ticker.Stop()
-
-	for range ticker.C {
-		entries, err := os.ReadDir(s.sessionsDir)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			subDir := filepath.Join(s.sessionsDir, e.Name())
-			subs, err := os.ReadDir(subDir)
-			if err != nil {
-				continue
-			}
-			for _, f := range subs {
-				if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
-					continue
-				}
-				sessID := f.Name()
-				path := filepath.Join(subDir, f.Name())
-				info, err := os.Stat(path)
-				if err != nil {
-					continue
-				}
-
-				s.fileModMu.Lock()
-				lastMod, known := s.fileMod[sessID]
-				s.fileMod[sessID] = info.ModTime()
-				s.fileModMu.Unlock()
-
-				if known && info.ModTime().After(lastMod) {
-					s.broadcast(sessID, "reload")
-				}
-			}
+	s.scanFiles()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.scanFiles()
 		}
 	}
 }
 
-// ── HTTP Handlers ──────────────────────────────────────────────────────────
-
-func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	sessions, err := loadAllSessions(s.sessionsDir)
+func (s *server) scanFiles() {
+	root, err := os.OpenRoot(s.sessionsDir)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
 		return
 	}
+	defer root.Close()
+	projects, err := os.ReadDir(s.sessionsDir)
+	if err != nil {
+		return
+	}
+	next := make(map[string]fileStamp)
+	for _, project := range projects {
+		if !project.IsDir() || project.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		dir, err := root.Open(project.Name())
+		if err != nil {
+			continue
+		}
+		files, err := dir.ReadDir(-1)
+		dir.Close()
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if !file.Type().IsRegular() || !strings.HasSuffix(file.Name(), ".jsonl") {
+				continue
+			}
+			id := project.Name() + "/" + file.Name()
+			info, err := root.Lstat(id)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			stamp := fileStamp{info.ModTime(), info.Size()}
+			next[id] = stamp
+			if before, known := s.fileMod[id]; known && before != stamp {
+				s.broadcast(id, "reload")
+			}
+		}
+	}
+	for id := range s.fileMod {
+		if _, exists := next[id]; !exists {
+			s.broadcast(id, "reload")
+		}
+	}
+	s.fileMod = next
+}
 
+// The local server deliberately has no authentication. Prevent browser-origin
+// access and DNS rebinding to the default loopback listener.
+func isLoopbackHost(host string) bool {
+	return strings.EqualFold(host, "localhost") || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
+}
+
+func (s *server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/session", s.handleSession)
+	mux.HandleFunc("/api/session", s.handleApiSession)
+	mux.HandleFunc("/export", s.handleExport)
+	mux.HandleFunc("/share", s.handleShare)
+	mux.HandleFunc("/events", s.handleEvents)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if isLoopbackHost(s.bindHost) && !isLoopbackHost(host) {
+			http.Error(w, "unrecognized host for local listener", http.StatusForbidden)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(r, origin) {
+			http.Error(w, "cross-origin access denied", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			http.Error(w, "cross-site access denied", http.StatusForbidden)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func sameOrigin(r *http.Request, origin string) bool {
+	u, err := url.Parse(origin)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return err == nil && u.Scheme == scheme && u.Host == r.Host && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == ""
+}
+
+func allowRead(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	w.Header().Set("Allow", "GET, HEAD")
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
+func writeJSONError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if !allowRead(w, r) {
+		return
+	}
+	sessions, err := loadAllSessions(s.sessionsDir)
+	if err != nil {
+		http.Error(w, "unable to read sessions directory", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := indexTmpl.Execute(w, sessions); err != nil {
 		fmt.Fprintf(os.Stderr, "template error: %v\n", err)
 	}
 }
 
-func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
+func (s *server) requestedSession(w http.ResponseWriter, r *http.Request) (Session, bool) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		http.Error(w, "missing id", 400)
-		return
+		writeJSONError(w, http.StatusBadRequest, "missing id")
+		return Session{}, false
 	}
-
-	sessions, err := loadAllSessions(s.sessionsDir)
+	sess, err := findSession(s.sessionsDir, id)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		status := http.StatusNotFound
+		if errors.Is(err, errAmbiguousSession) {
+			status = http.StatusConflict
+		}
+		writeJSONError(w, status, err.Error())
+		return Session{}, false
+	}
+	return sess, true
+}
+
+func (s *server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if !allowRead(w, r) {
 		return
 	}
-
-	for _, sess := range sessions {
-		if sess.ID == id {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Write([]byte(generateExportHtml(sess, true)))
-			return
-		}
+	sess, ok := s.requestedSession(w, r)
+	if !ok {
+		return
 	}
-	http.Error(w, "session not found", 404)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(generateExportHtml(sess, true, s.sharingEnabled)))
 }
 
 func (s *server) handleApiSession(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, `{"error":"missing id"}`, 400)
+	if !allowRead(w, r) {
 		return
 	}
-
-	sessions, err := loadAllSessions(s.sessionsDir)
-	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, 500)
+	sess, ok := s.requestedSession(w, r)
+	if !ok {
 		return
 	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]any{"header": sess.Header, "entries": sess.Entries, "leafId": lastLeafID(sess.Entries)})
+}
 
-	for _, sess := range sessions {
-		if sess.ID == id {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"header":  sess.Header,
-				"entries": sess.Entries,
-			})
-			return
-		}
+func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
+	if !allowRead(w, r) {
+		return
 	}
-	http.Error(w, `{"error":"not found"}`, 404)
+	sess, ok := s.requestedSession(w, r)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": strings.TrimSuffix(sess.Filename, ".jsonl") + ".html"}))
+	w.Write([]byte(generateExportHtml(sess, false)))
 }
 
 func findGh() string {
@@ -779,130 +641,125 @@ func findGh() string {
 }
 
 func (s *server) handleShare(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, `{"error":"missing id"}`, 400)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSONError(w, http.StatusMethodNotAllowed, "sharing requires POST")
 		return
 	}
-
-	// Verify gh is installed and logged in
+	if !s.sharingEnabled {
+		writeJSONError(w, http.StatusForbidden, "sharing is disabled; restart with -enable-sharing to opt in")
+		return
+	}
+	if !sameOrigin(r, r.Header.Get("Origin")) || r.Header.Get("X-Pi-Share") != "1" {
+		writeJSONError(w, http.StatusForbidden, "same-origin confirmation required")
+		return
+	}
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType != "application/json" {
+		writeJSONError(w, http.StatusUnsupportedMediaType, "JSON confirmation required")
+		return
+	}
+	var confirmation struct {
+		Confirmed bool `json:"confirmed"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&confirmation); err != nil || !confirmation.Confirmed {
+		writeJSONError(w, http.StatusBadRequest, "explicit upload confirmation required")
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeJSONError(w, http.StatusBadRequest, "invalid confirmation")
+		return
+	}
+	sess, ok := s.requestedSession(w, r)
+	if !ok {
+		return
+	}
 	ghPath := findGh()
 	if ghPath == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]any{"error": "GitHub CLI (gh) not installed. Install from https://cli.github.com/"})
+		writeJSONError(w, http.StatusBadRequest, "GitHub CLI (gh) not installed. Install from https://cli.github.com/")
 		return
 	}
-	authCheck := exec.Command(ghPath, "auth", "status")
-	if err := authCheck.Run(); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]any{"error": "GitHub CLI not logged in. Run 'gh auth login' first."})
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, ghPath, "auth", "status").Run(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "GitHub CLI not logged in. Run 'gh auth login' first.")
 		return
 	}
-
-	// Generate session HTML
-	sessions, err := loadAllSessions(s.sessionsDir)
+	tmpDir, err := os.MkdirTemp("", "pi-share-*")
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
-		return
-	}
-
-	var html string
-	for _, sess := range sessions {
-		if sess.ID == id {
-			html = generateExportHtml(sess, false)
-			break
-		}
-	}
-	if html == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]any{"error": "session not found"})
-		return
-	}
-
-	// Write to temp file with proper name for gist
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "pi-share-*")
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]any{"error": "failed to create temp dir: " + err.Error()})
+		writeJSONError(w, http.StatusInternalServerError, "failed to create temporary export")
 		return
 	}
 	defer os.RemoveAll(tmpDir)
 	tmpFile := filepath.Join(tmpDir, "session.html")
-	if err := os.WriteFile(tmpFile, []byte(html), 0644); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]any{"error": "failed to write temp file: " + err.Error()})
+	if err := os.WriteFile(tmpFile, []byte(generateExportHtml(sess, false)), 0600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to write temporary export")
 		return
 	}
-
-	// Create secret gist
-	cmd := exec.Command(ghPath, "gist", "create", "--public=false", tmpFile)
-	out, err := cmd.Output()
+	// gh creates secret (unlisted, not private) Gists by default.
+	out, err := exec.CommandContext(ctx, ghPath, "gist", "create", "--", tmpFile).Output()
 	if err != nil {
-		var stderr string
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr = string(exitErr.Stderr)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]any{"error": "failed to create gist", "stderr": stderr})
+		writeJSONError(w, http.StatusBadGateway, "GitHub did not confirm the upload. Check your Gists before retrying to avoid duplicates.")
 		return
 	}
-
-	gistUrl := strings.TrimSpace(string(out))
-	gistId := ""
-	if parts := strings.Split(gistUrl, "/"); len(parts) > 0 {
-		gistId = parts[len(parts)-1]
+	gistURL := strings.TrimSpace(string(out))
+	u, err := url.Parse(gistURL)
+	if err != nil || u.Scheme != "https" || u.Host != "gist.github.com" {
+		writeJSONError(w, http.StatusBadGateway, "upload returned an unexpected response; check your GitHub Gists")
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"gistUrl":    gistUrl,
-		"gistId":     gistId,
-		"previewUrl": "https://pi.dev/session/#" + gistId,
-	})
+	gistID := filepath.Base(u.Path)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]any{"gistUrl": gistURL, "gistId": gistID, "previewUrl": "https://pi.dev/session/#" + gistID})
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	sessID := r.URL.Query().Get("id")
-	if sessID == "" {
-		http.Error(w, "missing id", 400)
+	if !allowRead(w, r) {
 		return
 	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-
+	sess, ok := s.requestedSession(w, r)
+	if !ok {
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
-
-	ch := s.addClient(sessID)
-	client := &sseClient{ch: ch, sessID: sessID}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	client := s.addClient(sess.ID)
 	defer s.removeClient(client)
-
-	fmt.Fprintf(w, ":ok\n\n")
+	fmt.Fprint(w, ":ok\n\n")
 	flusher.Flush()
-
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
-		case msg, open := <-ch:
+		case msg, open := <-client.ch:
 			if !open {
 				return
 			}
-			fmt.Fprintf(w, "data: %s\n\n", msg)
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", msg); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ":keepalive\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-r.Context().Done():
+			return
+		case <-s.done:
 			return
 		}
 	}
@@ -924,41 +781,117 @@ type Session struct {
 
 // ── Loading ────────────────────────────────────────────────────────────────
 
+var errSessionNotFound = errors.New("session not found")
+var errAmbiguousSession = errors.New("ambiguous filename; open this session from the dashboard")
+
+func validSessionPart(part string) bool {
+	return part != "" && part != "." && part != ".." && !strings.ContainsAny(part, "/\\\x00")
+}
+
+func readRootSession(root *os.Root, project, filename string) (Session, error) {
+	if !validSessionPart(project) || !validSessionPart(filename) || !strings.HasSuffix(filename, ".jsonl") {
+		return Session{}, errSessionNotFound
+	}
+	projectInfo, err := root.Lstat(project)
+	if err != nil || !projectInfo.IsDir() {
+		return Session{}, errSessionNotFound
+	}
+	path := project + "/" + filename
+	info, err := root.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return Session{}, errSessionNotFound
+	}
+	file, err := root.Open(path)
+	if err != nil {
+		return Session{}, errSessionNotFound
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return Session{}, errSessionNotFound
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return Session{}, errSessionNotFound
+	}
+	return parseSessionData(data, project, filename, info.ModTime()), nil
+}
+
+func findSession(dir, id string) (Session, error) {
+	parts := strings.Split(id, "/")
+	if len(parts) == 2 {
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return Session{}, errSessionNotFound
+		}
+		defer root.Close()
+		return readRootSession(root, parts[0], parts[1])
+	}
+	// Retain old bookmarks only when the filename uniquely identifies a session.
+	if len(parts) != 1 || !validSessionPart(id) || !strings.HasSuffix(id, ".jsonl") {
+		return Session{}, errSessionNotFound
+	}
+	sessions, err := loadAllSessions(dir)
+	if err != nil {
+		return Session{}, errSessionNotFound
+	}
+	var found *Session
+	for i := range sessions {
+		if sessions[i].Filename == id {
+			if found != nil {
+				return Session{}, errAmbiguousSession
+			}
+			found = &sessions[i]
+		}
+	}
+	if found == nil {
+		return Session{}, errSessionNotFound
+	}
+	return *found, nil
+}
+
 func loadAllSessions(dir string) ([]Session, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-
-	var sessions []Session
+	sessions := make([]Session, 0)
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
 			continue
 		}
-		subDir := filepath.Join(dir, e.Name())
-		subs, err := os.ReadDir(subDir)
+		subDir, err := root.Open(e.Name())
 		if err != nil {
 			continue
 		}
-		for _, f := range subs {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
+		files, err := subDir.ReadDir(-1)
+		subDir.Close()
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if !file.Type().IsRegular() || !strings.HasSuffix(file.Name(), ".jsonl") {
 				continue
 			}
-			path := filepath.Join(subDir, f.Name())
-			sess, err := parseSession(path, e.Name(), f.Name())
-			if err != nil {
-				continue
+			sess, err := readRootSession(root, e.Name(), file.Name())
+			if err == nil {
+				sessions = append(sessions, sess)
 			}
-			sessions = append(sessions, sess)
 		}
 	}
-
 	sort.Slice(sessions, func(i, j int) bool {
-		ti, _ := time.Parse(time.RFC3339, sessions[i].LastActivity)
-		tj, _ := time.Parse(time.RFC3339, sessions[j].LastActivity)
+		ti, _ := time.Parse(time.RFC3339Nano, sessions[i].LastActivity)
+		tj, _ := time.Parse(time.RFC3339Nano, sessions[j].LastActivity)
+		if ti.Equal(tj) {
+			return sessions[i].ID < sessions[j].ID
+		}
 		return ti.After(tj)
 	})
-
 	return sessions, nil
 }
 
@@ -967,61 +900,64 @@ func parseSession(path, dirName, fileName string) (Session, error) {
 	if err != nil {
 		return Session{}, err
 	}
-
-	sess := Session{
-		ID:       fileName,
-		Filename: fileName,
-		Project:  cleanProjectName(dirName),
+	info, err := os.Stat(path)
+	if err != nil {
+		return Session{}, err
 	}
+	return parseSessionData(data, dirName, fileName, info.ModTime()), nil
+}
 
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	for _, line := range lines {
+func parseSessionData(data []byte, dirName, fileName string, modified time.Time) Session {
+	sess := Session{ID: dirName + "/" + fileName, Filename: fileName, Project: cleanProjectName(dirName), Header: make(map[string]any), Entries: make([]map[string]any, 0)}
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		var raw map[string]any
-		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		if err := json.Unmarshal([]byte(line), &raw); err != nil || raw == nil {
 			continue
 		}
-
+		kind, ok := raw["type"].(string)
+		if !ok || kind == "" {
+			continue
+		}
+		if kind == "message" {
+			if msg, ok := raw["message"].(map[string]any); !ok || msg == nil {
+				continue
+			}
+		}
 		sess.Entries = append(sess.Entries, raw)
-
-		if raw["type"] == "session" {
+		if kind == "session" {
 			sess.Header = raw
-			continue
 		}
-
 		if ts, ok := raw["timestamp"].(string); ok {
-			sess.LastActivity = ts
+			if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+				last, _ := time.Parse(time.RFC3339Nano, sess.LastActivity)
+				if t.After(last) {
+					sess.LastActivity = ts
+				}
+			}
 		}
-
-		if raw["type"] == "message" {
-			msg, ok := raw["message"].(map[string]any)
-			if ok {
-				sess.MessageCount++
-				if usage, ok := msg["usage"].(map[string]any); ok {
-					if t, ok := usage["totalTokens"].(float64); ok {
-						sess.TokenTotal += int(t)
-					}
-					if cost, ok := usage["cost"].(map[string]any); ok {
-						if total, ok := cost["total"].(float64); ok {
-							sess.CostTotal += total
-						}
+		if kind == "message" {
+			msg := raw["message"].(map[string]any)
+			sess.MessageCount++
+			if usage, ok := msg["usage"].(map[string]any); ok {
+				if n, ok := usage["totalTokens"].(float64); ok && n > 0 && n < 1e15 {
+					sess.TokenTotal += int(n)
+				}
+				if cost, ok := usage["cost"].(map[string]any); ok {
+					if total, ok := cost["total"].(float64); ok && total > 0 {
+						sess.CostTotal += total
 					}
 				}
 			}
 		}
 	}
-
 	if sess.LastActivity == "" {
-		info, _ := os.Stat(path)
-		if info != nil {
-			sess.LastActivity = info.ModTime().Format(time.RFC3339)
-		}
+		sess.LastActivity = modified.Format(time.RFC3339Nano)
 	}
-
-	return sess, nil
+	return sess
 }
 
 func cleanProjectName(dirName string) string {
@@ -1033,11 +969,20 @@ func cleanProjectName(dirName string) string {
 
 // ── HTML Export Generation (replicates pi's /export exactly) ───────────────
 
-func generateExportHtml(session Session, showButtons bool) string {
-	leafID := ""
-	if len(session.Entries) > 0 {
-		leafID = session.Entries[len(session.Entries)-1]["id"].(string)
+func lastLeafID(entries []map[string]any) string {
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i]["type"] == "session" {
+			continue
+		}
+		if id, ok := entries[i]["id"].(string); ok && id != "" {
+			return id
+		}
 	}
+	return ""
+}
+
+func generateExportHtml(session Session, showButtons bool, sharing ...bool) string {
+	leafID := lastLeafID(session.Entries)
 
 	sessionData := map[string]any{
 		"header":        session.Header,
@@ -1069,11 +1014,14 @@ func generateExportHtml(session Session, showButtons bool) string {
 	html = strings.Replace(html, "{{MARKED_JS}}", markedJs, 1)
 	html = strings.Replace(html, "{{HIGHLIGHT_JS}}", hljsJs, 1)
 
+	// A downloaded export stays self-contained and cannot load remote images.
+	html = strings.Replace(html, "<head>", `<head><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="`+strings.ReplaceAll(contentSecurityPolicy, "; frame-ancestors 'none'", "")+`">`, 1)
 	if showButtons {
-		btns := `<div style="position:fixed;top:10px;right:10px;z-index:101;display:flex;flex-direction:column;gap:6px;">
-<a href="/" title="Back to sessions" style="padding:4px 10px;font-size:11px;font-family:inherit;background:var(--container-bg);color:var(--muted);border:1px solid var(--dim);border-radius:3px;text-decoration:none;cursor:pointer;text-align:center;">← Sessions</a>
-<button id="share-btn" title="Share session as GitHub Gist" style="padding:4px 10px;font-size:11px;font-family:inherit;background:var(--container-bg);color:var(--muted);border:1px solid var(--dim);border-radius:3px;cursor:pointer;">↗ Share</button>
-</div>`
+		btns := `<nav class="viewer-actions" aria-label="Session actions"><a class="viewer-action" href="/" title="Back to sessions">← Sessions</a><a class="viewer-action" href="/export?id=` + template.HTMLEscapeString(url.QueryEscape(session.ID)) + `" download title="Download a self-contained HTML file. Nothing is uploaded.">↓ Export HTML</a>`
+		if len(sharing) > 0 && sharing[0] {
+			btns += `<button class="viewer-action" id="share-btn" title="Upload the full transcript to a secret GitHub Gist">↗ Share</button>`
+		}
+		btns += `</nav>`
 		html = strings.Replace(html, "<body>", "<body>"+btns, 1)
 		html = strings.Replace(html, "</body>", liveReloadJs+"</body>", 1)
 	}
@@ -1147,7 +1095,7 @@ func sessionName(s Session) string {
 		if e["type"] == "message" {
 			msg, ok := e["message"].(map[string]any)
 			if ok {
-				if role, _ := msg["role"].(string);				role == "user" {
+				if role, _ := msg["role"].(string); role == "user" {
 					content := msg["content"]
 					var text string
 					switch v := content.(type) {
@@ -1162,8 +1110,8 @@ func sessionName(s Session) string {
 							}
 						}
 					}
-					if len(text) > 80 {
-						text = text[:80] + "…"
+					if runes := []rune(text); len(runes) > 80 {
+						text = string(runes[:80]) + "…"
 					}
 					return text
 				}
@@ -1180,209 +1128,7 @@ var funcMap = template.FuncMap{
 	"sessionName": sessionName,
 }
 
-var indexTmpl = template.Must(template.New("index").Funcs(funcMap).Parse(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pi Sessions</title>
-<style>
-:root {
-  --body-bg: #18181e;
-  --container-bg: #1e1e24;
-  --text: #c9d1d9;
-  --muted: #808080;
-  --dim: #666666;
-  --accent: #8abeb7;
-  --border: #5f87ff;
-  --border-accent: #00d7ff;
-  --line-height: 18px;
-}
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
-  font-size: 12px;
-  line-height: var(--line-height);
-  color: var(--text);
-  background: var(--body-bg);
-  min-height: 100vh;
-}
-.header {
-  background: var(--container-bg);
-  border-bottom: 1px solid var(--dim);
-  padding: calc(var(--line-height)) calc(var(--line-height) * 2);
-}
-.header-inner {
-  max-width: 1200px;
-  margin: 0 auto;
-}
-.header h1 {
-  font-size: 12px;
-  font-weight: bold;
-  color: var(--border-accent);
-  margin-bottom: var(--line-height);
-}
-.search-box {
-  margin-bottom: var(--line-height);
-}
-.search-box input {
-  width: 100%;
-  padding: 4px 8px;
-  font-size: 11px;
-  font-family: inherit;
-  background: var(--body-bg);
-  color: var(--text);
-  border: 1px solid var(--dim);
-  border-radius: 3px;
-}
-.search-box input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-.search-box input::placeholder {
-  color: var(--muted);
-}
-.stats-bar {
-  font-size: 11px;
-  color: var(--dim);
-}
-.content {
-  padding: calc(var(--line-height)) calc(var(--line-height) * 2);
-  max-width: 1200px;
-  margin: 0 auto;
-}
-.project-group {
-  margin-bottom: calc(var(--line-height) * 2);
-}
-.project-name {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  color: var(--muted);
-  letter-spacing: 0.05em;
-  margin-bottom: var(--line-height);
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--dim);
-}
-.session-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: var(--line-height);
-}
-.session-card {
-  background: var(--container-bg);
-  border: 1px solid var(--dim);
-  border-radius: 4px;
-  padding: var(--line-height);
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
-}
-.session-card:hover {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--container-bg) 95%, var(--accent));
-}
-.session-card.hidden {
-  display: none;
-}
-.session-title {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text);
-  margin-bottom: 4px;
-  line-height: var(--line-height);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-.session-project {
-  font-size: 11px;
-  color: var(--accent);
-  margin-bottom: 8px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.session-meta {
-  font-size: 11px;
-  color: var(--muted);
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.empty-state {
-  text-align: center;
-  padding: 60px 20px;
-  color: var(--muted);
-}
-.empty-state h3 {
-  margin: 0 0 8px;
-  color: var(--text);
-}
-::-webkit-scrollbar { width: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #484f58; }
-@media (max-width: 700px) {
-  .header, .content { padding: var(--line-height) 16px; }
-  .session-grid { grid-template-columns: 1fr; }
-}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="header-inner">
-    <h1>🥧 Pi Sessions</h1>
-    <div class="search-box">
-      <input type="text" id="search" placeholder="Search sessions..." autofocus>
-    </div>
-    <div class="stats-bar">{{ len . }} sessions</div>
-  </div>
-</div>
-<div class="content">
-  {{ $currentProject := "" }}
-  {{ range . }}
-    {{ if ne .Project $currentProject }}
-      {{ if ne $currentProject "" }}</div>{{ end }}
-      <div class="project-group" data-project="{{ .Project | html }}">
-        <div class="project-name">{{ .Project | html }}</div>
-        <div class="session-grid">
-      {{ $currentProject = .Project }}
-    {{ end }}
-    <div class="session-card" data-id="{{ .ID }}" data-search="{{ sessionName . | html }} {{ .Project | html }}">
-      <div class="session-title">{{ sessionName . | html }}</div>
-      <div class="session-project">{{ .Project | html }}</div>
-      <div class="session-meta">
-        <span>{{ fmtTime .LastActivity }}</span>
-        <span>{{ .MessageCount }} msgs</span>
-        <span>{{ fmtTokens .TokenTotal }} tok</span>
-        <span>{{ fmtCost .CostTotal }}</span>
-      </div>
-    </div>
-  {{ end }}
-  {{ if ne $currentProject "" }}</div></div>{{ end }}
-</div>
-<script>
-const search = document.getElementById('search');
-const cards = document.querySelectorAll('.session-card');
-const groups = document.querySelectorAll('.project-group');
+//go:embed templates/index.html
+var indexHtml string
 
-search.addEventListener('input', (e) => {
-  const q = e.target.value.toLowerCase();
-  cards.forEach(card => {
-    card.classList.toggle('hidden', !card.dataset.search.toLowerCase().includes(q));
-  });
-  groups.forEach(g => {
-    const visible = g.querySelectorAll('.session-card:not(.hidden)').length;
-    g.style.display = visible > 0 ? '' : 'none';
-  });
-});
-
-cards.forEach(card => {
-  card.addEventListener('click', () => {
-    window.location.href = '/session?id=' + encodeURIComponent(card.dataset.id);
-  });
-});
-</script>
-</body>
-</html>`))
+var indexTmpl = template.Must(template.New("index").Funcs(funcMap).Parse(indexHtml))

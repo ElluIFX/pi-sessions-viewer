@@ -1,0 +1,78 @@
+name: Linux amd64 build and release
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish VERSION as a GitHub Release
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Check, test, and race-test
+        run: |
+          test -z "$(gofmt -l *.go)"
+          go vet ./...
+          go test -race ./...
+          node --check templates/template.js
+      - name: Build portable Linux amd64 package
+        run: bash scripts/build-release.sh
+      - name: Smoke-test release binary
+        run: bash scripts/smoke-test.sh
+      - name: Install browser-test tools (development only)
+        run: |
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+      - name: Browser regression tests
+        run: npm run test:browser
+      - name: Save browser screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-screenshots
+          path: browser-artifacts/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-amd64
+          path: dist/*
+          if-no-files-found: error
+  release:
+    needs: build
+    if: >-
+      github.repository == 'ElluIFX/pi-sessions-viewer' &&
+      github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')) ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Download tested build and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name linux-amd64 --dir dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          tag="v$(tr -d '\r\n' < VERSION)"
+          gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+            --title "Pi Sessions Viewer $tag · Linux amd64" \
+            --notes-file docs/RELEASE-NOTES.md

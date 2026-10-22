@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Your self-hosted Pi session library. Search, explore, and revisit your coding conversations.">
+<title>Sessions · Pi</title>
+<script>
+(function () {
+  try {
+    var theme = localStorage.getItem('pi-sessions-theme');
+    if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+  } catch (_) {}
+})();
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f7f8; --surface: #ffffff; --surface-hover: #fbfdfc; --soft: #f0f3f2;
+  --text: #202a2f; --secondary: #58666d; --muted: #66747a; --line: #e2e7e6;
+  --accent: #0b765e; --accent-soft: #e7f4ee; --accent-line: #a0cdbb;
+  --shadow: 0 4px 16px #172a2310; --focus: #238a70;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111719; --surface: #182023; --surface-hover: #1c2729; --soft: #222c2e;
+  --text: #e5eceb; --secondary: #b3c0c3; --muted: #94a6aa; --line: #2b383b;
+  --accent: #70d9ba; --accent-soft: #203c33; --accent-line: #467c69;
+  --shadow: 0 4px 20px #00000024; --focus: #70d9ba;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111719; --surface: #182023; --surface-hover: #1c2729; --soft: #222c2e;
+    --text: #e5eceb; --secondary: #b3c0c3; --muted: #94a6aa; --line: #2b383b;
+    --accent: #70d9ba; --accent-soft: #203c33; --accent-line: #467c69;
+    --shadow: 0 4px 20px #00000024; --focus: #70d9ba;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+button, input, select { font: inherit; }
+button, select { cursor: pointer; }
+a { color: inherit; }
+button, a, input, select { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 4px; }
+.icon { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+.icon-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+.container { max-width: 1240px; padding: 0 40px; margin: 0 auto; }
+.skip-link { position: fixed; top: -100px; left: 16px; z-index: 10; padding: 12px 20px; background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; }
+.skip-link:focus { top: 12px; }
+.topbar { border-bottom: 1px solid var(--line); background: var(--surface); }
+.topbar-inner { display: flex; align-items: center; justify-content: space-between; min-height: 78px; gap: 20px; }
+.brand { display: flex; align-items: center; text-decoration: none; gap: 11px; font-size: 17px; font-weight: 650; letter-spacing: -.5px; }
+.brand-mark { display: grid; place-items: center; width: 35px; height: 35px; border-radius: 11px; color: var(--surface); background: var(--accent); font: 600 29px/1 Georgia, serif; padding-bottom: 3px; }
+.brand-divider { height: 21px; width: 1px; background: var(--line); margin: 0 5px 0 10px; }
+.brand-section { color: var(--secondary); font-size: 14px; font-weight: 450; letter-spacing: 0; }
+.topbar-actions { display: flex; align-items: center; gap: 18px; }
+.local-badge { display: inline-flex; align-items: center; gap: 7px; color: var(--secondary); font-size: 12px; }
+.local-dot { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; }
+.icon-button { display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--secondary); }
+.icon-button:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+.hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 46px 0 30px; }
+.eyebrow { margin: 0 0 9px; color: var(--accent); font: 600 10px/1.5 var(--mono); letter-spacing: 1.7px; text-transform: uppercase; }
+h1 { margin: 0; font-size: clamp(28px, 4vw, 35px); line-height: 1.2; letter-spacing: -1.15px; font-weight: 650; }
+.hero-copy { margin: 11px 0 0; color: var(--secondary); font-size: 14px; }
+.button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 9px 13px; min-height: 40px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--secondary); text-decoration: none; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.button:hover { border-color: var(--accent-line); color: var(--accent); background: var(--surface-hover); }
+.button .icon { width: 15px; height: 15px; }
+.summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 14px; background: var(--surface); margin: 0 0 36px; overflow: hidden; }
+.stat { position: relative; padding: 21px 24px; }
+.stat + .stat { border-left: 1px solid var(--line); }
+.stat dt { display: flex; align-items: center; gap: 7px; color: var(--secondary); font-size: 12px; }
+.stat dt .icon { width: 15px; height: 15px; color: var(--muted); }
+.stat dd { margin: 8px 0 0; font-size: 27px; line-height: 1.25; letter-spacing: -.8px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.stat:first-child dd { color: var(--accent); }
+.section-heading { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+h2 { margin: 0; font-size: 16px; letter-spacing: -.3px; font-weight: 650; }
+.result-count { padding: 2px 7px; border-radius: 6px; background: var(--soft); color: var(--secondary); font: 11px/1.6 var(--mono); }
+.toolbar { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(150px, 220px) 175px; gap: 10px; margin-bottom: 16px; }
+.search-wrap { position: relative; display: flex; align-items: center; min-width: 0; }
+.search-wrap > .icon { position: absolute; left: 14px; color: var(--muted); width: 17px; height: 17px; pointer-events: none; }
+#search { width: 100%; padding: 11px 72px 11px 41px; height: 44px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; color: var(--text); font-size: 13px; }
+#search::placeholder { color: var(--muted); opacity: 1; }
+#search::-webkit-search-cancel-button { -webkit-appearance: none; }
+#search:focus { border-color: var(--accent); }
+.search-shortcut { position: absolute; right: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; font: 11px/20px var(--mono); pointer-events: none; }
+#clear-search { position: absolute; right: 7px; width: 30px; height: 30px; border: 0; background: transparent; }
+#clear-search .icon { width: 15px; height: 15px; }
+.select-wrap { position: relative; min-width: 0; }
+.select-wrap > .icon { position: absolute; top: 14px; right: 12px; width: 15px; height: 15px; color: var(--muted); pointer-events: none; }
+select { width: 100%; height: 44px; appearance: none; padding: 10px 32px 10px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--secondary); font-size: 12px; text-overflow: ellipsis; }
+.results-description { min-height: 20px; margin: 0 0 14px; color: var(--muted); font-size: 11px; }
+.results-description button { padding: 0; margin-left: 8px; border: 0; border-bottom: 1px solid currentColor; background: none; color: var(--accent); font-size: inherit; }
+.session-grid { list-style: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0; padding: 0; }
+.session-grid > li { min-width: 0; }
+.session-card { display: flex; flex-direction: column; height: 100%; min-height: 231px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); padding: 21px 21px 0; text-decoration: none; transition: border-color .15s, box-shadow .15s, transform .15s; }
+.session-card:hover { border-color: var(--accent-line); background: var(--surface-hover); box-shadow: var(--shadow); transform: translateY(-2px); }
+.card-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 15px; }
+.session-icon { width: 31px; height: 31px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border-radius: 9px; }
+.session-icon .icon { width: 16px; height: 16px; }
+.session-time { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.card-arrow { width: 14px; height: 14px; color: var(--muted); }
+.session-card:hover .card-arrow { color: var(--accent); }
+.session-title { margin: 0 0 12px; font-size: 14px; line-height: 1.55; font-weight: 600; letter-spacing: -.1px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; min-height: 43px; }
+.session-project { display: flex; align-items: center; gap: 6px; margin-bottom: 21px; color: var(--secondary); min-width: 0; }
+.session-project .icon { width: 13px; height: 13px; color: var(--muted); }
+.project-label { font: 10px/1.6 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-meta { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: auto; padding: 13px 0 15px; border-top: 1px solid var(--line); }
+.metric { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.metric-value { font: 500 12px/1.5 var(--mono); color: var(--secondary); font-variant-numeric: tabular-nums; }
+.metric-label { color: var(--muted); font-size: 9px; letter-spacing: .1px; }
+.empty-state { padding: 58px 20px 62px; text-align: center; background: var(--surface); border: 1px dashed var(--line); border-radius: 14px; }
+.empty-icon { display: grid; place-items: center; width: 53px; height: 53px; margin: 0 auto 18px; border-radius: 15px; background: var(--accent-soft); color: var(--accent); }
+.empty-icon .icon { width: 24px; height: 24px; }
+.empty-state h3 { margin: 0 0 8px; font-size: 18px; font-weight: 600; letter-spacing: -.35px; }
+.empty-state p { max-width: 420px; margin: 0 auto; color: var(--secondary); font-size: 13px; }
+.empty-state .button { margin-top: 21px; }
+.empty-state code { display: inline-block; overflow-wrap: anywhere; padding: 3px 7px; margin-top: 12px; border-radius: 5px; background: var(--soft); font: 11px/1.6 var(--mono); }
+.footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 28px 0 26px; margin-top: 28px; color: var(--muted); font-size: 10px; border-top: 1px solid var(--line); }
+.footer-note { display: inline-flex; align-items: center; gap: 6px; }
+.footer-note .icon { width: 12px; height: 12px; }
+.footer kbd { font: inherit; padding: 1px 4px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.noscript { padding: 12px 16px; background: var(--accent-soft); color: var(--text); border-radius: 8px; margin-bottom: 20px; font-size: 12px; }
+@media (min-width: 1250px) { .session-card { min-height: 239px; } }
+@media (max-width: 960px) { .session-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .container { padding: 0 28px; } .stat { padding: 19px; } .toolbar { grid-template-columns: minmax(180px, 1fr) 175px 160px; } }
+@media (max-width: 680px) {
+  .container { padding: 0 20px; } .topbar-inner { min-height: 67px; } .topbar-actions { gap: 12px; } .brand-divider { margin-left: 5px; }
+  .hero { padding: 32px 0 24px; align-items: flex-start; } .hero-copy { max-width: 270px; font-size: 13px; } .hero > .button { margin-top: 22px; padding: 9px; } .refresh-label { display: none; }
+  .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 29px; } .stat { padding: 16px 18px; } .stat dd { font-size: 24px; } .stat dt { font-size: 11px; }
+  .stat:nth-child(3) { border-left: 0; } .stat:nth-child(n+3) { border-top: 1px solid var(--line); }
+  .toolbar { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 9px; } .search-wrap { grid-column: 1 / -1; } .session-grid { gap: 13px; }
+  .session-card { padding: 17px 17px 0; } .footer { align-items: flex-start; } .keyboard-hint { display: none; }
+}
+@media (max-width: 480px) { .session-grid { grid-template-columns: minmax(0, 1fr); } .session-card { min-height: 215px; } .local-badge { display: none; } .session-title { min-height: 0; } .session-time { font-size: 11px; } .hero { gap: 10px; } h1 { font-size: 29px; } .footer { font-size: 9px; gap: 12px; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } .session-card:hover { transform: none; } }
+</style>
+</head>
+<body>
+<svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-3 3v-9.5A7.5 7.5 0 0 1 9.5 5h3a7.5 7.5 0 0 1 7.5 6.5Z"/><path d="M7 10h8M7 14h5"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7V5a1 1 0 0 1 1-1h5l3 3h8a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z"/></symbol>
+  <symbol id="i-stack" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></symbol>
+  <symbol id="i-cost" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M15 8h-4.5a2.5 2.5 0 0 0 0 5h3a2 2 0 0 1 0 4H9m3-11v13"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 18 17"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14a8 8 0 0 1-10-10 8.5 8.5 0 1 0 10 10Z"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
+</svg>
+<a class="skip-link" href="#sessions">Skip to sessions</a>
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a class="brand" href="/" aria-label="Pi Sessions home"><span class="brand-mark" aria-hidden="true">π</span><span>pi</span><span class="brand-divider" aria-hidden="true"></span><span class="brand-section">Sessions</span></a>
+    <div class="topbar-actions">
+      <span class="local-badge"><span class="local-dot" aria-hidden="true"></span>Local archive</span>
+      <button class="icon-button" id="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme" hidden><svg class="icon" aria-hidden="true"><use href="#i-moon" id="theme-icon"></use></svg></button>
+    </div>
+  </div>
+</header>
+<main class="container">
+  <section class="hero" aria-labelledby="page-title">
+    <div><p class="eyebrow">Your workspace, remembered</p><h1 id="page-title">Your session library</h1><p class="hero-copy">Revisit your work. Find the details. Pick up the thread.</p></div>
+    <a class="button" href="/" id="refresh" aria-label="Refresh sessions" title="Refresh sessions"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg><span class="refresh-label">Refresh</span></a>
+  </section>
+  <dl class="summary" aria-label="Library totals">
+    <div class="stat"><dt><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg>Sessions</dt><dd>{{ len . }}</dd></div>
+    <div class="stat"><dt><svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>Projects</dt><dd id="total-projects">—</dd></div>
+    <div class="stat"><dt><svg class="icon" aria-hidden="true"><use href="#i-stack"></use></svg>Recorded tokens</dt><dd id="total-tokens">—</dd></div>
+    <div class="stat"><dt><svg class="icon" aria-hidden="true"><use href="#i-cost"></use></svg>Recorded cost</dt><dd id="total-cost">—</dd></div>
+  </dl>
+  <section id="sessions" aria-labelledby="sessions-heading" tabindex="-1">
+    <div class="section-heading"><h2 id="sessions-heading">All sessions</h2><span class="result-count" id="result-count">{{ len . }}</span></div>
+    <div class="toolbar" id="toolbar" hidden>
+      <div class="search-wrap"><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg><label for="search" class="sr-only">Search by session title or project</label><input type="search" id="search" placeholder="Search sessions or projects…" autocomplete="off" spellcheck="false" aria-controls="session-list"><kbd class="search-shortcut" id="search-shortcut" aria-hidden="true">/</kbd><button class="icon-button" id="clear-search" type="button" aria-label="Clear search" title="Clear search" hidden><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button></div>
+      <div class="select-wrap"><label for="project-filter" class="sr-only">Filter by project</label><select id="project-filter" aria-controls="session-list"><option value="">All projects</option></select><svg class="icon" aria-hidden="true"><use href="#i-chevron"></use></svg></div>
+      <div class="select-wrap"><label for="sort-order" class="sr-only">Sort sessions</label><select id="sort-order" aria-controls="session-list"><option value="newest">Recently active</option><option value="oldest">Oldest activity</option><option value="messages">Most messages</option><option value="tokens">Most tokens</option><option value="cost">Highest cost</option><option value="title">Title A–Z</option></select><svg class="icon" aria-hidden="true"><use href="#i-chevron"></use></svg></div>
+    </div>
+    <noscript><p class="noscript">You can open every session below. Enable JavaScript for search, filters, sorting, and library totals.</p></noscript>
+    <p class="results-description" id="results-description" hidden><span id="results-text" role="status" aria-live="polite" aria-atomic="true"></span><button type="button" id="reset-filters" hidden>Clear filters</button></p>
+    <ul class="session-grid" id="session-list">
+      {{ range . }}
+      <li class="session-item" data-project="{{ .Project }}" data-title="{{ sessionName . }}" data-activity="{{ .LastActivity }}" data-messages="{{ .MessageCount }}" data-tokens="{{ .TokenTotal }}" data-cost="{{ .CostTotal }}">
+        <a class="session-card" href="/session?id={{ .ID }}">
+          <div class="card-top"><span class="session-icon"><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg></span><time class="session-time" datetime="{{ .LastActivity }}" title="{{ fmtTime .LastActivity }}">{{ fmtTime .LastActivity }}</time><svg class="icon card-arrow" aria-hidden="true"><use href="#i-arrow"></use></svg></div>
+          <h3 class="session-title">{{ sessionName . }}</h3>
+          <div class="session-project" title="{{ .Project }}"><svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg><span class="project-label">{{ if .Project }}{{ .Project }}{{ else }}Uncategorized{{ end }}</span></div>
+          <div class="session-meta"><span class="metric"><span class="metric-value">{{ .MessageCount }}</span><span class="metric-label">messages</span></span><span class="metric"><span class="metric-value">{{ fmtTokens .TokenTotal }}</span><span class="metric-label">tokens</span></span><span class="metric"><span class="metric-value">{{ fmtCost .CostTotal }}</span><span class="metric-label">recorded cost</span></span></div>
+        </a>
+      </li>
+      {{ end }}
+    </ul>
+    <div class="empty-state" id="no-results" hidden><span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg></span><h3>No matching sessions</h3><p>Try a different search or choose another project.</p><button class="button" id="empty-reset" type="button">Clear filters</button></div>
+    {{ if not . }}<div class="empty-state" id="empty-library"><span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg></span><h3>A fresh start</h3><p>Your Pi conversations will appear here once you have saved a session. Start a conversation in Pi, then refresh this page.</p><code>Default: ~/.pi/agent/sessions/</code></div>{{ end }}
+  </section>
+  <footer class="footer"><span>Pi Sessions Viewer <span aria-hidden="true">·</span> A little context goes a long way.</span><span class="footer-note"><svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>Self-hosted<span class="keyboard-hint">&nbsp; · &nbsp; <kbd>/</kbd> to search</span></span></footer>
+</main>
+<script>
+(function () {
+  'use strict';
+  var search = document.getElementById('search');
+  var projectFilter = document.getElementById('project-filter');
+  var sortOrder = document.getElementById('sort-order');
+  var list = document.getElementById('session-list');
+  var items = Array.from(list.querySelectorAll('.session-item')).map(function (element, index) {
+    return { element: element, index: index, project: element.dataset.project, title: element.dataset.title,
+      search: (element.dataset.title + ' ' + element.dataset.project).toLocaleLowerCase(),
+      activity: Date.parse(element.dataset.activity) || 0, messages: Number(element.dataset.messages) || 0,
+      tokens: Number(element.dataset.tokens) || 0, cost: Number(element.dataset.cost) || 0 };
+  });
+  var projects = new Map();
+  var tokens = 0, cost = 0;
+  items.forEach(function (item) { projects.set(item.project, (projects.get(item.project) || 0) + 1); tokens += item.tokens; cost += item.cost; });
+  function compact(number) {
+    if (number >= 1000000) return (number / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (number >= 1000) return (number / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return number.toLocaleString();
+  }
+  document.getElementById('total-projects').textContent = projects.size.toLocaleString();
+  document.getElementById('total-tokens').textContent = compact(tokens);
+  document.getElementById('total-tokens').title = tokens.toLocaleString() + ' recorded tokens';
+  document.getElementById('total-cost').textContent = cost > 0 && cost < 0.01 ? '$' + cost.toFixed(4) : '$' + cost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  document.getElementById('total-cost').title = 'Total reported by session usage records; not a billing statement';
+  Array.from(projects.keys()).sort(function (a, b) { return a.localeCompare(b); }).forEach(function (project) {
+    var option = document.createElement('option');
+    // The prefix keeps an empty project distinct from the all-projects option.
+    option.value = 'project:' + project;
+    option.textContent = (project || 'Uncategorized') + ' (' + projects.get(project) + ')';
+    projectFilter.appendChild(option);
+  });
+  function restoreFromURL() {
+    var params = new URLSearchParams(location.search);
+    search.value = params.get('q') || '';
+    var project = params.get('project');
+    projectFilter.value = project !== null && projects.has(project) ? 'project:' + project : '';
+    var sort = params.get('sort') || 'newest';
+    sortOrder.value = ['newest', 'oldest', 'messages', 'tokens', 'cost', 'title'].includes(sort) ? sort : 'newest';
+  }
+  function saveToURL() {
+    try {
+      var url = new URL(location.href);
+      if (search.value.trim()) url.searchParams.set('q', search.value); else url.searchParams.delete('q');
+      if (projectFilter.value) url.searchParams.set('project', projectFilter.value.slice(8)); else url.searchParams.delete('project');
+      if (sortOrder.value !== 'newest') url.searchParams.set('sort', sortOrder.value); else url.searchParams.delete('sort');
+      if (url.href !== location.href) history.replaceState(null, '', url);
+    } catch (_) {}
+  }
+  var previousSort = '';
+  function update(save) {
+    var query = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    var project = projectFilter.value;
+    var sort = sortOrder.value;
+    if (sort !== previousSort) {
+      var sorted = items.slice().sort(function (a, b) {
+        var result = sort === 'oldest' ? a.activity - b.activity : sort === 'title' ? a.title.localeCompare(b.title) :
+          sort === 'messages' ? b.messages - a.messages : sort === 'tokens' ? b.tokens - a.tokens :
+          sort === 'cost' ? b.cost - a.cost : b.activity - a.activity;
+        return result || a.index - b.index;
+      });
+      var fragment = document.createDocumentFragment();
+      sorted.forEach(function (item) { fragment.appendChild(item.element); });
+      list.appendChild(fragment);
+      previousSort = sort;
+    }
+    var visible = 0;
+    items.forEach(function (item) {
+      var matches = (!project || item.project === project.slice(8)) && query.every(function (word) { return item.search.includes(word); });
+      item.element.hidden = !matches;
+      if (matches) visible++;
+    });
+    var filtered = query.length > 0 || project !== '';
+    document.getElementById('result-count').textContent = visible;
+    document.getElementById('sessions-heading').textContent = filtered ? 'Filtered sessions' : 'All sessions';
+    document.getElementById('results-text').textContent = filtered ? 'Showing ' + visible + ' of ' + items.length + ' sessions' :
+      items.length + (items.length === 1 ? ' session' : ' sessions') + ' across ' + projects.size + (projects.size === 1 ? ' project' : ' projects');
+    document.getElementById('reset-filters').hidden = !filtered;
+    document.getElementById('clear-search').hidden = search.value.length === 0;
+    document.getElementById('search-shortcut').hidden = search.value.length > 0;
+    document.getElementById('no-results').hidden = visible > 0 || items.length === 0;
+    list.hidden = visible === 0;
+    if (save !== false) saveToURL();
+  }
+  function resetFilters() { search.value = ''; projectFilter.value = ''; update(); search.focus(); }
+  var pendingFrame = 0;
+  search.addEventListener('input', function () { cancelAnimationFrame(pendingFrame); pendingFrame = requestAnimationFrame(update); });
+  projectFilter.addEventListener('change', function () { update(); });
+  sortOrder.addEventListener('change', function () { update(); });
+  document.getElementById('clear-search').addEventListener('click', function () { search.value = ''; update(); search.focus(); });
+  document.getElementById('reset-filters').addEventListener('click', resetFilters);
+  document.getElementById('empty-reset').addEventListener('click', resetFilters);
+  document.getElementById('refresh').addEventListener('click', function (event) { event.preventDefault(); location.reload(); });
+  window.addEventListener('popstate', function () { restoreFromURL(); update(false); });
+  document.addEventListener('keydown', function (event) {
+    var editing = event.target instanceof HTMLElement && (event.target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName));
+    if ((!editing && event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey) || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k')) {
+      event.preventDefault(); search.focus(); search.select();
+    } else if (event.key === 'Escape' && document.activeElement === search && search.value) {
+      search.value = ''; update();
+    }
+  });
+  var dateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  items.forEach(function (item) {
+    if (!item.activity) return;
+    var time = item.element.querySelector('time');
+    var elapsed = Date.now() - item.activity;
+    if (elapsed >= 0 && elapsed < 60000) time.textContent = 'Just now';
+    else if (elapsed >= 60000 && elapsed < 3600000) time.textContent = Math.floor(elapsed / 60000) + 'm ago';
+    else if (elapsed >= 3600000 && elapsed < 86400000) time.textContent = Math.floor(elapsed / 3600000) + 'h ago';
+    else time.textContent = dateFormat.format(new Date(item.activity));
+    time.title = new Date(item.activity).toLocaleString();
+  });
+  var themeToggle = document.getElementById('theme-toggle');
+  var media = window.matchMedia('(prefers-color-scheme: dark)');
+  function isDark() { return document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : media.matches; }
+  function updateThemeButton() {
+    var label = isDark() ? 'Switch to light theme' : 'Switch to dark theme';
+    themeToggle.setAttribute('aria-label', label); themeToggle.title = label;
+    document.getElementById('theme-icon').setAttribute('href', isDark() ? '#i-sun' : '#i-moon');
+  }
+  themeToggle.addEventListener('click', function () {
+    var theme = isDark() ? 'light' : 'dark';
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem('pi-sessions-theme', theme); } catch (_) {}
+    updateThemeButton();
+  });
+  if (media.addEventListener) media.addEventListener('change', updateThemeButton);
+  window.addEventListener('storage', function (event) {
+    if (event.key !== 'pi-sessions-theme') return;
+    if (event.newValue === 'light' || event.newValue === 'dark') document.documentElement.dataset.theme = event.newValue;
+    else delete document.documentElement.dataset.theme;
+    updateThemeButton();
+  });
+  restoreFromURL(); update(false); updateThemeButton();
+  themeToggle.hidden = false;
+  document.getElementById('toolbar').hidden = false;
+  document.getElementById('results-description').hidden = false;
+})();
+</script>
+</body>
+</html>
